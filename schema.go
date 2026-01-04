@@ -1,6 +1,12 @@
 package doodle
 
-import "fmt"
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+
+	"gopkg.in/yaml.v3"
+)
 
 // Schema holds entity and relationship definitions
 type Schema struct {
@@ -45,6 +51,39 @@ type Relationship struct {
 	JoinTable  string
 	FromKey    string
 	ToKey      string
+}
+
+// RelationshipBuilder provides fluent API for defining relationships
+type RelationshipBuilder struct {
+	schema     *Schema
+	name       string
+	fromEntity string
+	toEntity   string
+}
+
+// Relationship starts building a new relationship with the given name
+func (s *Schema) Relationship(name string) *RelationshipBuilder {
+	return &RelationshipBuilder{
+		schema: s,
+		name:   name,
+	}
+}
+
+// From sets the source entity
+func (rb *RelationshipBuilder) From(entity string) *RelationshipBuilder {
+	rb.fromEntity = entity
+	return rb
+}
+
+// To sets the target entity
+func (rb *RelationshipBuilder) To(entity string) *RelationshipBuilder {
+	rb.toEntity = entity
+	return rb
+}
+
+// Via completes the relationship with junction table details
+func (rb *RelationshipBuilder) Via(table, fromKey, toKey string) *Relationship {
+	return rb.schema.AddRelationship(rb.name, rb.fromEntity, rb.toEntity, table, fromKey, toKey)
 }
 
 // NewSchema creates an empty schema
@@ -142,4 +181,94 @@ func (s *Schema) Validate() error {
 		}
 	}
 	return nil
+}
+
+// SchemaDefinition represents a declarative schema in JSON/YAML
+type SchemaDefinition struct {
+	Entities      map[string]EntityDefinition      `json:"entities" yaml:"entities"`
+	Relationships map[string]RelationshipDefinition `json:"relationships" yaml:"relationships"`
+}
+
+// EntityDefinition defines an entity in JSON/YAML format
+type EntityDefinition struct {
+	Table      string            `json:"table" yaml:"table"`
+	PrimaryKey string            `json:"primary_key" yaml:"primary_key"`
+	Fields     map[string]string `json:"fields,omitempty" yaml:"fields,omitempty"`
+	Temporal   bool              `json:"temporal,omitempty" yaml:"temporal,omitempty"`
+}
+
+// RelationshipDefinition defines a relationship in JSON/YAML format
+type RelationshipDefinition struct {
+	From    string `json:"from" yaml:"from"`
+	To      string `json:"to" yaml:"to"`
+	Table   string `json:"table" yaml:"table"`
+	FromKey string `json:"from_key" yaml:"from_key"`
+	ToKey   string `json:"to_key" yaml:"to_key"`
+}
+
+// LoadSchemaFromFile loads a schema from a JSON or YAML file
+func LoadSchemaFromFile(path string) (*Schema, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("reading schema file: %w", err)
+	}
+	return LoadSchema(data)
+}
+
+// LoadSchema parses schema from JSON or YAML bytes
+func LoadSchema(data []byte) (*Schema, error) {
+	var def SchemaDefinition
+
+	// Try JSON first, then YAML
+	if err := json.Unmarshal(data, &def); err != nil {
+		if err := yaml.Unmarshal(data, &def); err != nil {
+			return nil, fmt.Errorf("parsing schema: %w", err)
+		}
+	}
+
+	return buildSchemaFromDefinition(&def)
+}
+
+// LoadSchemaFromJSON parses schema from JSON bytes
+func LoadSchemaFromJSON(data []byte) (*Schema, error) {
+	var def SchemaDefinition
+	if err := json.Unmarshal(data, &def); err != nil {
+		return nil, fmt.Errorf("parsing JSON schema: %w", err)
+	}
+	return buildSchemaFromDefinition(&def)
+}
+
+// LoadSchemaFromYAML parses schema from YAML bytes
+func LoadSchemaFromYAML(data []byte) (*Schema, error) {
+	var def SchemaDefinition
+	if err := yaml.Unmarshal(data, &def); err != nil {
+		return nil, fmt.Errorf("parsing YAML schema: %w", err)
+	}
+	return buildSchemaFromDefinition(&def)
+}
+
+func buildSchemaFromDefinition(def *SchemaDefinition) (*Schema, error) {
+	schema := NewSchema()
+
+	// Add entities
+	for name, entDef := range def.Entities {
+		ent := schema.AddEntity(name, entDef.Table, entDef.PrimaryKey)
+		for fieldName, colName := range entDef.Fields {
+			ent.AddField(fieldName, colName)
+		}
+		if entDef.Temporal {
+			ent.WithTemporal()
+		}
+	}
+
+	// Add relationships
+	for name, relDef := range def.Relationships {
+		schema.AddRelationship(name, relDef.From, relDef.To, relDef.Table, relDef.FromKey, relDef.ToKey)
+	}
+
+	if err := schema.Validate(); err != nil {
+		return nil, err
+	}
+
+	return schema, nil
 }

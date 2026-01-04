@@ -15,17 +15,19 @@ package main
 
 import (
     "context"
-    "fmt"
     "github.com/bresrch/doodle"
     _ "github.com/lib/pq"
 )
 
 func main() {
-    // Define schema
+    // Define schema with fluent API
     schema := doodle.NewSchema()
-    schema.AddEntity("user", "users", "id")
-    schema.AddEntity("group", "groups", "id")
-    schema.AddRelationship("member_of", "user", "group", "user_groups", "user_id", "group_id")
+    schema.AddEntity("user", "users", "id").WithTemporal()
+    schema.AddEntity("group", "groups", "id").WithTemporal()
+
+    schema.Relationship("member_of").
+        From("user").To("group").
+        Via("user_groups", "user_id", "group_id")
 
     // Create doodle instance
     db := doodle.New(schema)
@@ -36,6 +38,13 @@ func main() {
     rows, _ := db.Query(context.Background(),
         "SELECT ->member_of->group FROM user:alice")
 }
+```
+
+Or load schema from YAML:
+
+```go
+schema, _ := doodle.LoadSchemaFromFile("schema.yaml")
+db := doodle.New(schema)
 ```
 
 ## Schema Definition
@@ -79,7 +88,15 @@ Temporal entities expect these columns in the database:
 
 ### Relationships
 
-Relationships define graph edges via junction tables:
+Relationships define graph edges via junction tables. Use the fluent builder for readable definitions:
+
+```go
+schema.Relationship("member_of").
+    From("user").To("group").
+    Via("user_groups", "user_id", "group_id")
+```
+
+Or the positional API:
 
 ```go
 schema.AddRelationship("member_of", "user", "group", "user_groups", "user_id", "group_id")
@@ -91,7 +108,51 @@ schema.AddRelationship("member_of", "user", "group", "user_groups", "user_id", "
 //                          └── relationship name (query alias)
 ```
 
-The relationship name (`member_of`) is a **logical alias** used in queries - it maps to the junction table, not a column within it. The junction table itself represents the relationship.
+The relationship name (`member_of`) is a **logical alias** used in queries - it maps to the junction table, not a column within it.
+
+### Real-World Identity Examples
+
+**User → Device (enrolled devices, MFA tokens)**
+```go
+schema.Relationship("uses").
+    From("user").To("device").
+    Via("user_devices", "user_id", "device_id")
+```
+```sql
+SELECT ->uses->device FROM user:alice              -- devices alice uses
+SELECT <-uses<-user FROM device:yubikey_abc123     -- who uses this YubiKey
+```
+
+**User → Factor (authentication factors)**
+```go
+schema.Relationship("enrolled").
+    From("user").To("factor").
+    Via("user_factors", "user_id", "factor_id")
+```
+```sql
+SELECT ->enrolled->factor FROM user:alice          -- alice's enrolled factors
+```
+
+**App → SignOnPolicy (app security requirements)**
+```go
+schema.Relationship("governed_by").
+    From("app").To("policy").
+    Via("app_policies", "app_id", "policy_id")
+```
+```sql
+SELECT ->governed_by->policy FROM app:slack        -- policies for Slack
+```
+
+**Policy → FactorType (required factors)**
+```go
+schema.Relationship("requires").
+    From("policy").To("factor_type").
+    Via("policy_requirements", "policy_id", "factor_type_id")
+```
+```sql
+-- What factor types are required to access Slack?
+SELECT ->governed_by->policy->requires->factor_type FROM app:slack
+```
 
 ### Multiple Relationship Types
 
@@ -112,8 +173,13 @@ CREATE TABLE user_group_admins (
 ```
 
 ```go
-schema.AddRelationship("member_of", "user", "group", "user_group_members", "user_id", "group_id")
-schema.AddRelationship("admin_of", "user", "group", "user_group_admins", "user_id", "group_id")
+schema.Relationship("member_of").
+    From("user").To("group").
+    Via("user_group_members", "user_id", "group_id")
+
+schema.Relationship("admin_of").
+    From("user").To("group").
+    Via("user_group_admins", "user_id", "group_id")
 ```
 
 Now you can query each relationship type separately:
@@ -211,8 +277,217 @@ schema.AddEntity("app", "apps", "id").
     WithTemporal().
     AddField("name", "name")
 
-schema.AddRelationship("member_of", "user", "group", "user_groups", "user_id", "group_id")
-schema.AddRelationship("has_access", "group", "app", "group_apps", "group_id", "app_id")
+schema.Relationship("member_of").
+    From("user").To("group").
+    Via("user_groups", "user_id", "group_id")
+
+schema.Relationship("has_access").
+    From("group").To("app").
+    Via("group_apps", "group_id", "app_id")
+```
+
+### Loading Schema from YAML
+
+Define your schema declaratively:
+
+```yaml
+# schema.yaml
+entities:
+  user:
+    table: users
+    primary_key: id
+    temporal: true
+    fields:
+      email: email
+      status: status
+      provider: provider
+
+  device:
+    table: devices
+    primary_key: id
+    temporal: true
+    fields:
+      name: device_name
+      type: device_type
+
+  factor:
+    table: factors
+    primary_key: id
+    fields:
+      type: factor_type
+      status: status
+
+relationships:
+  uses:
+    from: user
+    to: device
+    table: user_devices
+    from_key: user_id
+    to_key: device_id
+
+  enrolled:
+    from: user
+    to: factor
+    table: user_factors
+    from_key: user_id
+    to_key: factor_id
+```
+
+Load in Go:
+
+```go
+schema, err := doodle.LoadSchemaFromFile("schema.yaml")
+if err != nil {
+    log.Fatal(err)
+}
+
+db := doodle.New(schema)
+```
+
+### Loading Schema from JSON
+
+```json
+{
+  "entities": {
+    "user": {
+      "table": "users",
+      "primary_key": "id",
+      "temporal": true,
+      "fields": {
+        "email": "email",
+        "status": "status"
+      }
+    },
+    "device": {
+      "table": "devices",
+      "primary_key": "id",
+      "fields": {
+        "name": "device_name"
+      }
+    }
+  },
+  "relationships": {
+    "uses": {
+      "from": "user",
+      "to": "device",
+      "table": "user_devices",
+      "from_key": "user_id",
+      "to_key": "device_id"
+    }
+  }
+}
+```
+
+```go
+schema, err := doodle.LoadSchemaFromJSON(jsonBytes)
+// or auto-detect format:
+schema, err := doodle.LoadSchema(data) // works with JSON or YAML
+```
+
+### Provider-Based Schema Registration
+
+In plugin architectures (like Bresearch providers), each provider can register its own entities and relationships. This allows providers to extend the schema with domain-specific data models.
+
+```go
+// Core schema with base entities
+schema := doodle.NewSchema()
+schema.AddEntity("user", "users", "id").WithTemporal()
+schema.AddEntity("group", "groups", "id").WithTemporal()
+schema.AddEntity("app", "apps", "id").WithTemporal()
+
+// Provider: Okta - registers identity relationships
+func (p *OktaProvider) RegisterSchema(schema *doodle.Schema) {
+    schema.Relationship("member_of").
+        From("user").To("group").
+        Via("okta_user_groups", "user_id", "group_id")
+
+    schema.Relationship("assigned_to").
+        From("user").To("app").
+        Via("okta_user_apps", "user_id", "app_id")
+}
+
+// Provider: CrowdStrike - registers device/security relationships
+func (p *CrowdStrikeProvider) RegisterSchema(schema *doodle.Schema) {
+    schema.AddEntity("device", "devices", "id").
+        WithTemporal().
+        AddField("hostname", "hostname").
+        AddField("os", "operating_system")
+
+    schema.AddEntity("vulnerability", "vulnerabilities", "id").
+        AddField("cve", "cve_id").
+        AddField("severity", "severity")
+
+    schema.Relationship("uses").
+        From("user").To("device").
+        Via("user_devices", "user_id", "device_id")
+
+    schema.Relationship("has_vulnerability").
+        From("device").To("vulnerability").
+        Via("device_vulnerabilities", "device_id", "vulnerability_id")
+}
+
+// Provider: Okta (MFA) - registers factor relationships
+func (p *OktaMFAProvider) RegisterSchema(schema *doodle.Schema) {
+    schema.AddEntity("factor", "factors", "id").
+        AddField("type", "factor_type").
+        AddField("status", "status")
+
+    schema.AddEntity("policy", "policies", "id").
+        AddField("name", "name").
+        AddField("type", "policy_type")
+
+    schema.AddEntity("factor_type", "factor_types", "id").
+        AddField("name", "name")
+
+    schema.Relationship("enrolled").
+        From("user").To("factor").
+        Via("user_factors", "user_id", "factor_id")
+
+    schema.Relationship("governed_by").
+        From("app").To("policy").
+        Via("app_policies", "app_id", "policy_id")
+
+    schema.Relationship("requires").
+        From("policy").To("factor_type").
+        Via("policy_requirements", "policy_id", "factor_type_id")
+}
+```
+
+After providers register their schemas, you can query across all providers:
+
+```sql
+-- Find all devices a user has with vulnerabilities
+SELECT ->uses->device->has_vulnerability->vulnerability FROM user:alice
+
+-- What MFA factors are required for Slack access?
+SELECT ->governed_by->policy->requires->factor_type FROM app:slack
+
+-- Users with enrolled YubiKeys who have vulnerable devices
+SELECT <-enrolled<-user->uses->device->has_vulnerability->vulnerability
+FROM factor WHERE type = 'hardware_token'
+```
+
+Each provider can also supply its schema via YAML embedded in the provider binary or configuration:
+
+```go
+//go:embed schema.yaml
+var schemaYAML []byte
+
+func (p *OktaProvider) RegisterSchema(schema *doodle.Schema) error {
+    providerSchema, err := doodle.LoadSchemaFromYAML(schemaYAML)
+    if err != nil {
+        return err
+    }
+
+    // Merge provider schema into main schema
+    for name, entity := range providerSchema.Entities {
+        schema.Entities[name] = entity
+    }
+    for key, rel := range providerSchema.Relationships {
+        schema.Relationships[key] = rel
+    }
+    return nil
+}
 ```
 
 ## Query Syntax
