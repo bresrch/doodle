@@ -1,0 +1,17 @@
+services:
+  postgres:
+    image: postgres:18beta1
+    container_name: doodle-postgres
+    environment:
+      POSTGRES_USER: doodle
+      POSTGRES_PASSWORD: doodle
+      POSTGRES_DB: doodle_test
+    ports:
+      - "5439:5432"
+    volumes:
+      - ./testdata/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U doodle -d doodle_test"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
