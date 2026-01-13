@@ -1,0 +1,22 @@
+services:
+  postgres:
+    image: postgres:17
+    container_name: doodle-postgres-unit
+    environment:
+      POSTGRES_USER: doodle
+      POSTGRES_PASSWORD: doodle
+      POSTGRES_DB: doodle_unit
+    ports:
+      - "5440:5432"
+    volumes:
+      # Init scripts run in alphabetical order
+      - ./testdata/init.sql:/docker-entrypoint-initdb.d/01_init.sql
+      - ./testdata/seed_unit.sql:/docker-entrypoint-initdb.d/02_seed.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U doodle -d doodle_unit"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    tmpfs:
+      - /var/lib/postgresql/data

@@ -531,6 +531,11 @@ func (g *Generator) generateWithRecursivePath(q *Query, startEntity *Entity, sta
 		sql.WriteString("WHERE 1=1 ")
 	}
 
+	// Add temporal filter for relationship (junction table)
+	if rel.Temporal != nil {
+		sql.WriteString(fmt.Sprintf("AND j0.%s = 'infinity' ", rel.Temporal.ValidToColumn))
+	}
+
 	// Add ID filter if present
 	if q.From.ID != "" {
 		result.Params = append(result.Params, q.From.ID)
@@ -542,6 +547,12 @@ func (g *Generator) generateWithRecursivePath(q *Query, startEntity *Entity, sta
 	// Recursive case: follow relationship again (for self-referential relationships)
 	sql.WriteString(fmt.Sprintf("SELECT j.%s AS id, p.depth + 1 FROM path_cte p ", targetKey))
 	sql.WriteString(fmt.Sprintf("JOIN %s j ON p.id = j.%s ", rel.JoinTable, sourceKey))
+
+	// Add temporal filter for relationship in recursive case
+	if rel.Temporal != nil {
+		sql.WriteString(fmt.Sprintf("AND j.%s = 'infinity' ", rel.Temporal.ValidToColumn))
+	}
+
 	sql.WriteString(fmt.Sprintf("WHERE p.depth < %d", maxHops))
 
 	sql.WriteString(") ")
@@ -622,11 +633,19 @@ func (g *Generator) processTraversals(travs []*Traversal, currentEntity, prevAli
 
 		// Junction table join
 		joinAlias := aliases.nextJoin()
-		*joins = append(*joins, fmt.Sprintf(
-			"%s %s %s ON %s.%s = %s.%s",
-			joinType, rel.JoinTable, joinAlias,
+		joinCondition := fmt.Sprintf("%s.%s = %s.%s",
 			result.FinalAlias, prevEntity.PrimaryKey,
-			joinAlias, sourceKey,
+			joinAlias, sourceKey)
+
+		// Add temporal filter for temporal relationships (current state only)
+		if rel.Temporal != nil {
+			joinCondition += fmt.Sprintf(" AND %s.%s = 'infinity'", joinAlias, rel.Temporal.ValidToColumn)
+		}
+
+		*joins = append(*joins, fmt.Sprintf(
+			"%s %s %s ON %s",
+			joinType, rel.JoinTable, joinAlias,
+			joinCondition,
 		))
 
 		// Collect junction field if specified on relationship traversal
@@ -1229,6 +1248,11 @@ func (g *Generator) generateNegatedPathCondition(cond *Condition, aliases *alias
 		sourceKey = rel.ToKey
 	}
 	subqWhere = append(subqWhere, fmt.Sprintf("sj0.%s = %s.%s", sourceKey, defaultAlias, startEntityDef.PrimaryKey))
+
+	// Add temporal filter for the relationship (junction table)
+	if rel.Temporal != nil {
+		subqWhere = append(subqWhere, fmt.Sprintf("sj0.%s = 'infinity'", rel.Temporal.ValidToColumn))
+	}
 
 	// Get the target field - either from ConditionField.Field or from last Traversal.Field
 	targetField := cond.Left.Field
@@ -1919,6 +1943,7 @@ func (g *Generator) generateInsertRelationship(stmt *InsertStmt) (*GeneratedQuer
 }
 
 // generateDeleteRelationship generates SQL for deleting a relationship
+// For temporal relationships, performs soft delete (sets valid_to = NOW())
 func (g *Generator) generateDeleteRelationship(stmt *DeleteStmt) (*GeneratedQuery, error) {
 	result := &GeneratedQuery{
 		Params: make([]interface{}, 0),
@@ -1962,27 +1987,58 @@ func (g *Generator) generateDeleteRelationship(stmt *DeleteStmt) (*GeneratedQuer
 		targetKey = rel.FromKey
 	}
 
-	sql.WriteString(fmt.Sprintf("DELETE FROM %s WHERE ", rel.JoinTable))
+	// For temporal relationships without FORCE, soft delete (set valid_to = NOW())
+	if rel.Temporal != nil && !stmt.Force {
+		sql.WriteString(fmt.Sprintf("UPDATE %s SET %s = NOW() WHERE ",
+			rel.JoinTable, rel.Temporal.ValidToColumn))
 
-	// Source ID subquery
-	result.Params = append(result.Params, cleanID(stmt.ID))
-	sql.WriteString(fmt.Sprintf("%s = (SELECT id FROM %s WHERE external_id = $%d",
-		sourceKey, sourceEntity.Table, len(result.Params)))
-	if sourceEntity.Temporal != nil {
-		sql.WriteString(fmt.Sprintf(" AND %s = 'infinity'", sourceEntity.Temporal.ValidToColumn))
-	}
-	sql.WriteString(")")
-
-	// Target ID subquery (if specified)
-	targetID := targetTrav.Field
-	if targetID != "" {
-		result.Params = append(result.Params, cleanID(targetID))
-		sql.WriteString(fmt.Sprintf(" AND %s = (SELECT id FROM %s WHERE external_id = $%d",
-			targetKey, targetEntity.Table, len(result.Params)))
-		if targetEntity.Temporal != nil {
-			sql.WriteString(fmt.Sprintf(" AND %s = 'infinity'", targetEntity.Temporal.ValidToColumn))
+		// Source ID subquery
+		result.Params = append(result.Params, cleanID(stmt.ID))
+		sql.WriteString(fmt.Sprintf("%s = (SELECT id FROM %s WHERE external_id = $%d",
+			sourceKey, sourceEntity.Table, len(result.Params)))
+		if sourceEntity.Temporal != nil {
+			sql.WriteString(fmt.Sprintf(" AND %s = 'infinity'", sourceEntity.Temporal.ValidToColumn))
 		}
 		sql.WriteString(")")
+
+		// Target ID subquery (if specified)
+		targetID := targetTrav.Field
+		if targetID != "" {
+			result.Params = append(result.Params, cleanID(targetID))
+			sql.WriteString(fmt.Sprintf(" AND %s = (SELECT id FROM %s WHERE external_id = $%d",
+				targetKey, targetEntity.Table, len(result.Params)))
+			if targetEntity.Temporal != nil {
+				sql.WriteString(fmt.Sprintf(" AND %s = 'infinity'", targetEntity.Temporal.ValidToColumn))
+			}
+			sql.WriteString(")")
+		}
+
+		// Only update current (not already deleted) relationships
+		sql.WriteString(fmt.Sprintf(" AND %s = 'infinity'", rel.Temporal.ValidToColumn))
+	} else {
+		// Hard delete (non-temporal or FORCE)
+		sql.WriteString(fmt.Sprintf("DELETE FROM %s WHERE ", rel.JoinTable))
+
+		// Source ID subquery
+		result.Params = append(result.Params, cleanID(stmt.ID))
+		sql.WriteString(fmt.Sprintf("%s = (SELECT id FROM %s WHERE external_id = $%d",
+			sourceKey, sourceEntity.Table, len(result.Params)))
+		if sourceEntity.Temporal != nil {
+			sql.WriteString(fmt.Sprintf(" AND %s = 'infinity'", sourceEntity.Temporal.ValidToColumn))
+		}
+		sql.WriteString(")")
+
+		// Target ID subquery (if specified)
+		targetID := targetTrav.Field
+		if targetID != "" {
+			result.Params = append(result.Params, cleanID(targetID))
+			sql.WriteString(fmt.Sprintf(" AND %s = (SELECT id FROM %s WHERE external_id = $%d",
+				targetKey, targetEntity.Table, len(result.Params)))
+			if targetEntity.Temporal != nil {
+				sql.WriteString(fmt.Sprintf(" AND %s = 'infinity'", targetEntity.Temporal.ValidToColumn))
+			}
+			sql.WriteString(")")
+		}
 	}
 
 	result.SQL = sql.String()

@@ -54,22 +54,30 @@ CREATE TABLE apps (
     UNIQUE(external_id, version)
 );
 
--- Junction: user_groups (member_of relationship)
+-- Junction: user_groups (member_of relationship) with temporal versioning
 CREATE TABLE user_groups (
     user_id UUID REFERENCES users(id) ON DELETE CASCADE,
     group_id UUID REFERENCES groups(id) ON DELETE CASCADE,
     role TEXT DEFAULT 'member',
-    created_at TIMESTAMPTZ DEFAULT now(),
-    PRIMARY KEY (user_id, group_id)
+
+    -- Temporal versioning
+    valid_from TIMESTAMPTZ NOT NULL DEFAULT now(),
+    valid_to TIMESTAMPTZ NOT NULL DEFAULT 'infinity',
+
+    PRIMARY KEY (user_id, group_id, valid_from)
 );
 
--- Junction: group_apps (has_access relationship)
+-- Junction: group_apps (has_access relationship) with temporal versioning
 CREATE TABLE group_apps (
     group_id UUID REFERENCES groups(id) ON DELETE CASCADE,
     app_id UUID REFERENCES apps(id) ON DELETE CASCADE,
     permission TEXT DEFAULT 'read',
-    created_at TIMESTAMPTZ DEFAULT now(),
-    PRIMARY KEY (group_id, app_id)
+
+    -- Temporal versioning
+    valid_from TIMESTAMPTZ NOT NULL DEFAULT now(),
+    valid_to TIMESTAMPTZ NOT NULL DEFAULT 'infinity',
+
+    PRIMARY KEY (group_id, app_id, valid_from)
 );
 
 -- Insert test data (current versions)
@@ -152,8 +160,10 @@ CREATE INDEX idx_apps_current ON apps(external_id) WHERE valid_to = 'infinity';
 
 CREATE INDEX idx_user_groups_user_id ON user_groups(user_id);
 CREATE INDEX idx_user_groups_group_id ON user_groups(group_id);
+CREATE INDEX idx_user_groups_current ON user_groups(user_id, group_id) WHERE valid_to = 'infinity';
 CREATE INDEX idx_group_apps_group_id ON group_apps(group_id);
 CREATE INDEX idx_group_apps_app_id ON group_apps(app_id);
+CREATE INDEX idx_group_apps_current ON group_apps(group_id, app_id) WHERE valid_to = 'infinity';
 
 -- Insert historical version for Alice (email changed)
 INSERT INTO users (external_id, email, first_name, last_name, status, provider, raw_data, version, valid_from, valid_to)
@@ -169,3 +179,10 @@ VALUES (
     '2024-01-01 00:00:00+00',
     '2024-06-01 00:00:00+00'
 );
+
+-- Insert historical relationship: Bob was previously in admins group (removed on 2024-06-01)
+INSERT INTO user_groups (user_id, group_id, role, valid_from, valid_to)
+SELECT u.id, g.id, 'admin', '2024-01-01 00:00:00+00', '2024-06-01 00:00:00+00'
+FROM users u, groups g
+WHERE u.external_id = 'okta_user_002' AND g.external_id = 'okta_group_admins'
+  AND u.valid_to = 'infinity' AND g.valid_to = 'infinity';

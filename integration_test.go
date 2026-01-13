@@ -61,8 +61,10 @@ func integrationSchema() *Schema {
 		AddField("app_type", "app_type").
 		AddField("provider", "provider")
 
-	s.AddRelationship("member_of", "user", "group", "user_groups", "user_id", "group_id")
-	s.AddRelationship("has_access", "group", "app", "group_apps", "group_id", "app_id")
+	s.AddRelationship("member_of", "user", "group", "user_groups", "user_id", "group_id").
+		WithTemporal()
+	s.AddRelationship("has_access", "group", "app", "group_apps", "group_id", "app_id").
+		WithTemporal()
 
 	return s
 }

@@ -51,6 +51,35 @@ type Relationship struct {
 	JoinTable  string
 	FromKey    string
 	ToKey      string
+
+	// Temporal configuration for versioned relationships
+	Temporal *RelationshipTemporalConfig
+}
+
+// RelationshipTemporalConfig defines temporal versioning columns for relationships
+type RelationshipTemporalConfig struct {
+	ValidFromColumn string // e.g., "valid_from"
+	ValidToColumn   string // e.g., "valid_to"
+}
+
+// DefaultRelationshipTemporalConfig returns standard temporal column names for relationships
+func DefaultRelationshipTemporalConfig() *RelationshipTemporalConfig {
+	return &RelationshipTemporalConfig{
+		ValidFromColumn: "valid_from",
+		ValidToColumn:   "valid_to",
+	}
+}
+
+// WithTemporal enables temporal versioning for the relationship
+func (r *Relationship) WithTemporal() *Relationship {
+	r.Temporal = DefaultRelationshipTemporalConfig()
+	return r
+}
+
+// WithTemporalConfig enables temporal versioning with custom column names
+func (r *Relationship) WithTemporalConfig(config *RelationshipTemporalConfig) *Relationship {
+	r.Temporal = config
+	return r
 }
 
 // RelationshipBuilder provides fluent API for defining relationships
@@ -199,11 +228,12 @@ type EntityDefinition struct {
 
 // RelationshipDefinition defines a relationship in JSON/YAML format
 type RelationshipDefinition struct {
-	From    string `json:"from" yaml:"from"`
-	To      string `json:"to" yaml:"to"`
-	Table   string `json:"table" yaml:"table"`
-	FromKey string `json:"from_key" yaml:"from_key"`
-	ToKey   string `json:"to_key" yaml:"to_key"`
+	From     string `json:"from" yaml:"from"`
+	To       string `json:"to" yaml:"to"`
+	Table    string `json:"table" yaml:"table"`
+	FromKey  string `json:"from_key" yaml:"from_key"`
+	ToKey    string `json:"to_key" yaml:"to_key"`
+	Temporal bool   `json:"temporal,omitempty" yaml:"temporal,omitempty"`
 }
 
 // LoadSchemaFromFile loads a schema from a JSON or YAML file
@@ -263,7 +293,10 @@ func buildSchemaFromDefinition(def *SchemaDefinition) (*Schema, error) {
 
 	// Add relationships
 	for name, relDef := range def.Relationships {
-		schema.AddRelationship(name, relDef.From, relDef.To, relDef.Table, relDef.FromKey, relDef.ToKey)
+		rel := schema.AddRelationship(name, relDef.From, relDef.To, relDef.Table, relDef.FromKey, relDef.ToKey)
+		if relDef.Temporal {
+			rel.WithTemporal()
+		}
 	}
 
 	if err := schema.Validate(); err != nil {
