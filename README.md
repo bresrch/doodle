@@ -736,7 +736,17 @@ SELECT ->member_of.role->group->has_access.permission->app FROM user:alice
 
 ### Variable-Length Paths (`->{n,m}->`)
 
-Traverse relationships with variable hop counts using recursive CTEs:
+Traverse relationships with variable hop counts using recursive CTEs. This is essential for hierarchical data like org structures, nested groups, or folder trees.
+
+#### Syntax Variants
+
+| Syntax | Meaning |
+|--------|---------|
+| `->rel{3}->` | Exactly 3 hops |
+| `->rel{1,5}->` | Between 1 and 5 hops (inclusive) |
+| `->rel{2,}->` | 2 or more hops (unbounded) |
+
+#### Basic Examples
 
 ```sql
 -- Find all managers 1-3 levels up
@@ -749,10 +759,261 @@ SELECT ->reports_to{2}->user FROM user:alice
 SELECT <-reports_to{1,5}<-user FROM user:ceo
 ```
 
-Requires a self-referential relationship in the schema:
+#### Group Hierarchy Example
+
+For nested group structures (e.g., "Engineering Team" → "All Engineering" → "Company Wide"):
+
 ```go
-schema.AddRelationship("reports_to", "user", "user", "user_managers", "user_id", "manager_id")
+// Define self-referential relationship for group nesting
+schema.Relationship("child_of").
+    From("group").To("group").
+    Via("group_hierarchy", "child_group_id", "parent_group_id")
 ```
+
+```sql
+-- Find all ancestor groups up to 10 levels deep
+SELECT ->child_of{1,10}->group FROM group:engineering_team
+
+-- Mixed path: find all ancestor groups for groups a user belongs to
+SELECT ->member_of->group->child_of{1,10}->group FROM user:alice
+```
+
+The mixed path query first traverses from user to their direct groups (non-recursive), then recursively climbs the group hierarchy.
+
+#### Generated SQL
+
+Variable-length paths generate PostgreSQL recursive CTEs:
+
+```sql
+-- Doodle: SELECT ->child_of{1,3}->group FROM group:engineering_team
+
+WITH RECURSIVE path_cte AS (
+    -- Base case: direct relationships (depth 1)
+    SELECT t1.id, 1 AS depth
+    FROM groups t0
+    JOIN group_hierarchy j0 ON t0.id = j0.child_group_id
+    JOIN groups t1 ON j0.parent_group_id = t1.id
+    WHERE t0.external_id = $1 AND t0.valid_to = 'infinity'
+      AND t1.valid_to = 'infinity'
+
+    UNION ALL
+
+    -- Recursive case: traverse deeper
+    SELECT t1.id, p.depth + 1
+    FROM path_cte p
+    JOIN group_hierarchy j0 ON p.id = j0.child_group_id
+    JOIN groups t1 ON j0.parent_group_id = t1.id
+    WHERE p.depth < 3  -- maxHops constraint
+      AND t1.valid_to = 'infinity'
+)
+SELECT DISTINCT t1.*
+FROM path_cte p
+JOIN groups t1 ON p.id = t1.id
+WHERE p.depth >= 1  -- minHops constraint
+```
+
+#### Schema Requirements
+
+Variable-length paths require a **self-referential relationship** where from and to entities are the same type:
+
+```go
+// User hierarchy (reports_to)
+schema.AddRelationship("reports_to", "user", "user", "user_managers", "user_id", "manager_id")
+
+// Group hierarchy (child_of)
+schema.AddRelationship("child_of", "group", "group", "group_hierarchy", "child_group_id", "parent_group_id")
+
+// Folder hierarchy (parent)
+schema.AddRelationship("parent", "folder", "folder", "folder_tree", "folder_id", "parent_folder_id")
+```
+
+#### Performance Notes
+
+- Recursive CTEs are powerful but can be expensive on deeply nested or wide hierarchies
+- The `depth` tracking ensures queries terminate even with cycles
+- Consider adding indexes on junction table foreign keys for large datasets
+- `DISTINCT` in the final select prevents duplicate results from multiple paths to the same node
+
+### Wildcard Relationship Traversal (`->*->`)
+
+Use `*` as a wildcard to traverse any relationship without specifying a name. This is useful for exploring graph connectivity or when you don't know which relationships exist.
+
+#### Single-Hop Wildcard
+
+```sql
+-- Find all entities connected to alice via any outgoing relationship
+SELECT ->*->* FROM user:alice
+
+-- Find all groups connected to alice via any relationship
+SELECT ->*->group FROM user:alice
+
+-- Find all users connected to admins via any incoming relationship
+SELECT <-*<-user FROM group:admins
+```
+
+The wildcard generates a UNION of all matching relationships. Each result includes an `_relationship` column showing which relationship was traversed.
+
+#### Recursive Wildcard
+
+Combine wildcards with quantifiers to explore multi-hop paths through any relationships:
+
+```sql
+-- Find all users reachable within 3 hops via any relationship
+SELECT ->*{1,3}->user FROM user:alice
+
+-- Explore all connected entities up to 5 hops
+SELECT ->*{1,5}->* FROM user:alice
+```
+
+This generates a recursive CTE that tracks `entity_type` as it traverses, allowing exploration of heterogeneous graphs.
+
+#### Example: Who Can Reach This Resource?
+
+```sql
+-- Find all users who can reach the slack app within 3 relationship hops
+SELECT <-*{1,3}<-user FROM app:slack
+```
+
+This query finds users connected to the app through any chain of relationships (direct assignment, group membership, nested groups, etc.).
+
+#### Generated SQL
+
+Single-hop wildcards generate UNION queries:
+
+```sql
+-- Doodle: SELECT ->*->group FROM user:alice
+
+SELECT t1.*, 'member_of' AS _relationship
+FROM users t0
+JOIN user_groups j0 ON t0.id = j0.user_id
+JOIN groups t1 ON j0.group_id = t1.id
+WHERE t0.external_id = $1 AND t0.valid_to = 'infinity' AND t1.valid_to = 'infinity'
+```
+
+Recursive wildcards generate recursive CTEs that explore all paths:
+
+```sql
+-- Doodle: SELECT ->*{1,3}->user FROM user:alice
+
+WITH RECURSIVE path_cte AS (
+    -- Base case: all first-level relationships from user
+    SELECT j.group_id AS id, 'group' AS entity_type, 1 AS depth
+    FROM users t0 JOIN user_groups j ON t0.id = j.user_id ...
+    UNION ALL
+    SELECT j.manager_id AS id, 'user' AS entity_type, 1 AS depth ...
+
+    UNION ALL
+
+    -- Recursive case: follow all relationships from each entity type
+    SELECT j.target_id AS id, 'target_type' AS entity_type, p.depth + 1
+    FROM path_cte p
+    JOIN entities e ON p.id = e.id AND p.entity_type = 'entity_type'
+    JOIN junction j ON e.id = j.source_id
+    WHERE p.depth < 3
+    ...
+)
+SELECT DISTINCT t.* FROM path_cte p
+JOIN users t ON p.id = t.id AND p.entity_type = 'user'
+WHERE p.depth >= 1 AND t.valid_to = 'infinity'
+```
+
+### Cross-Path Joins
+
+Cross-path joins allow you to traverse multiple independent paths and join them based on a condition. This is essential for queries like "find users and the policy rules that apply to their groups."
+
+#### Basic Syntax
+
+```sql
+SELECT fields
+FROM entity AS alias ->rel->entity AS alias
+JOIN entity:id ->rel->entity AS alias ->rel->entity AS alias
+ON left_alias.field = right_alias.field
+```
+
+#### Example: Users with Effective Policy Rules
+
+Find all users, their groups, and the policy rules that apply to those groups:
+
+```sql
+SELECT
+    u.email,
+    g.name AS access_group,
+    p.name AS policy_name,
+    r.name AS rule_name
+FROM user AS u
+    ->member_of->group AS g
+    ->has_access->app AS a
+JOIN app:slack
+    ->governed_by->policy AS p
+    ->has_rule->rule AS r
+    ->applies_to->group AS rg
+ON g.id = rg.id
+```
+
+This query:
+1. Traverses from users to their groups to the apps they can access
+2. Separately traverses from a specific app to its policies, rules, and the groups those rules apply to
+3. Joins where the user's group matches the rule's target group
+
+#### Schema for Policy-Based Access
+
+```go
+schema := doodle.NewSchema()
+
+// Entities
+schema.AddEntity("user", "users", "id").WithTemporal()
+schema.AddEntity("group", "groups", "id").WithTemporal()
+schema.AddEntity("app", "apps", "id").WithTemporal()
+schema.AddEntity("policy", "policies", "id").WithTemporal()
+schema.AddEntity("rule", "rules", "id").WithTemporal()
+
+// Access relationships
+schema.Relationship("member_of").From("user").To("group").Via("user_groups", "user_id", "group_id")
+schema.Relationship("has_access").From("group").To("app").Via("group_apps", "group_id", "app_id")
+
+// Policy relationships
+schema.Relationship("governed_by").From("app").To("policy").Via("app_policies", "app_id", "policy_id")
+schema.Relationship("has_rule").From("policy").To("rule").Via("policy_rules", "policy_id", "rule_id")
+schema.Relationship("applies_to").From("rule").To("group").Via("rule_groups", "rule_id", "group_id")
+```
+
+#### Multiple JOINs
+
+You can have multiple JOIN clauses to bring in data from different paths:
+
+```sql
+SELECT u.email, g.name, p.name, r.name, ra.role
+FROM user AS u ->member_of->group AS g
+JOIN app:slack ->governed_by->policy AS p ON g.app_id = p.app_id
+JOIN rule AS r ->assigned_to->user AS ra ON u.id = ra.id
+```
+
+#### Generated SQL
+
+Cross-path joins generate SQL with multiple JOIN chains and a WHERE clause for the ON condition:
+
+```sql
+-- Doodle: FROM user AS u ->member_of->group AS g JOIN app:slack ->governed_by->policy AS p ON g.id = p.group_id
+
+SELECT t0.*, t1.*, t3.*
+FROM users t0
+JOIN user_groups j0 ON t0.id = j0.user_id
+JOIN groups t1 ON j0.group_id = t1.id
+JOIN apps t2 ON t2.external_id = 'slack' AND t2.valid_to = 'infinity'
+JOIN app_policies j1 ON t2.id = j1.app_id
+JOIN policies t3 ON j1.policy_id = t3.id
+WHERE t0.valid_to = 'infinity'
+  AND t1.valid_to = 'infinity'
+  AND t3.valid_to = 'infinity'
+  AND t1.id = t3.group_id  -- ON condition
+```
+
+#### Use Cases
+
+- **Effective Policy Rules**: Find which rules apply to a user based on their group memberships
+- **Access Audit**: Show the full path from user to resource with all intermediate entities
+- **Compliance Reporting**: Join user access with the policies that govern that access
+- **Impact Analysis**: Find all users affected by a policy change
 
 ### NULL Operators
 

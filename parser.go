@@ -1,20 +1,22 @@
 package doodle
 
 import (
+	"strings"
+
 	"github.com/alecthomas/participle/v2"
 	"github.com/alecthomas/participle/v2/lexer"
 )
 
 var doodleLexer = lexer.MustSimple([]lexer.SimpleRule{
-	{Name: "Keyword", Pattern: `(?i)\b(SELECT|DISTINCT|FROM|WHERE|VERSION|GROUP|HAVING|LIMIT|OFFSET|ORDER|BY|ASC|DESC|AND|OR|IN|NOT|LIKE|BETWEEN|NULL|IS|EXISTS|true|false|AS|COUNT|SUM|AVG|MIN|MAX|UNION|INTERSECT|EXCEPT|ALL|CASE|WHEN|THEN|ELSE|END|COALESCE|NULLIF|WITH|UPPER|LOWER|CONCAT|TRIM|SUBSTRING|LENGTH|DATE_TRUNC|EXTRACT|NOW|CURRENT_DATE|ABS|ROUND|CEIL|FLOOR|ARRAY_AGG|STRING_AGG|JSON_AGG|JSON_BUILD_OBJECT|JSON_GET|JSON_TEXT|JSON_PATH|JSON_PATH_TEXT|INTERVAL|YEAR|MONTH|DAY|HOUR|MINUTE|SECOND|INSERT|INTO|VALUES|SET|DELETE|UPDATE|RETURNING|FORCE)\b`},
+	{Name: "Keyword", Pattern: `(?i)\b(SELECT|DISTINCT|FROM|WHERE|VERSION|VERSIONS|GROUP|HAVING|LIMIT|OFFSET|ORDER|BY|ASC|DESC|AND|OR|IN|NOT|LIKE|BETWEEN|NULL|IS|EXISTS|true|false|AS|COUNT|SUM|AVG|MIN|MAX|UNION|INTERSECT|EXCEPT|ALL|LAST|CASE|WHEN|THEN|ELSE|END|COALESCE|NULLIF|WITH|UPPER|LOWER|CONCAT|TRIM|SUBSTRING|LENGTH|DATE_TRUNC|EXTRACT|NOW|CURRENT_DATE|ABS|ROUND|CEIL|FLOOR|ARRAY_AGG|STRING_AGG|JSON_AGG|JSON_BUILD_OBJECT|JSON_GET|JSON_TEXT|JSON_PATH|JSON_PATH_TEXT|INTERVAL|YEAR|MONTH|DAY|HOUR|MINUTE|SECOND|INSERT|INTO|VALUES|SET|DELETE|UPDATE|RETURNING|FORCE|DIFF|RESTORE|meta)\b`},
 	{Name: "DateTime", Pattern: `d'[^']*'`},
 	{Name: "String", Pattern: `'[^']*'`},
 	{Name: "Float", Pattern: `[-+]?\d+\.\d+`},
 	{Name: "Int", Pattern: `[-+]?\d+`},
-	{Name: "Arrow", Pattern: `->!|<!-|->\?|<\?-|->|<-`},
+	{Name: "Arrow", Pattern: `<->|\?->|\?<-|!->|!<-|->!|<!-|->\?|<\?-|->|<-`},
 	{Name: "Operator", Pattern: `>=|<=|!=|=|>|<`},
 	{Name: "Ident", Pattern: `[a-zA-Z_][a-zA-Z0-9_]*`},
-	{Name: "Punct", Pattern: `[(),.:*{}+\-]`},
+	{Name: "Punct", Pattern: `[(),.:*{}+\-;\[\]]`},
 	{Name: "whitespace", Pattern: `\s+`},
 })
 
@@ -35,6 +37,8 @@ var Parser = participle.MustBuild[Query](
 
 // Parse parses a doodle query string into an AST
 func Parse(query string) (*Query, error) {
+	// Strip trailing semicolon if present
+	query = strings.TrimSuffix(strings.TrimSpace(query), ";")
 	return Parser.ParseString("", query)
 }
 
@@ -55,5 +59,7 @@ var StatementParser = participle.MustBuild[Statement](
 
 // ParseStatement parses a doodle statement (SELECT, INSERT, UPDATE, DELETE)
 func ParseStatement(stmt string) (*Statement, error) {
+	// Strip trailing semicolon if present
+	stmt = strings.TrimSuffix(strings.TrimSpace(stmt), ";")
 	return StatementParser.ParseString("", stmt)
 }

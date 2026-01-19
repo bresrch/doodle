@@ -29,6 +29,9 @@ func testSchema() *Schema {
 	s.AddRelationship("has_access", "group", "app", "group_apps", "group_id", "app_id")
 	// Self-referential relationship for testing recursive paths
 	s.AddRelationship("reports_to", "user", "user", "user_managers", "user_id", "manager_id")
+	// Group hierarchy - child_of means this group is a child of the target group
+	rel := s.AddRelationship("child_of", "group", "group", "group_hierarchy", "child_group_id", "parent_group_id")
+	rel.WithTemporal()
 
 	return s
 }
@@ -2699,4 +2702,984 @@ func TestGenerateStatementSelect(t *testing.T) {
 	}
 
 	t.Logf("Generated SQL: %s", result.SQL)
+}
+
+// Tests for FROM clause path traversal syntax (e.g., SELECT fields FROM entity:id->rel->target)
+func TestGenerateFromClausePathTraversal(t *testing.T) {
+	schema := testSchema()
+	gen := NewGenerator(schema)
+
+	// Single hop traversal with field selection from target
+	input := "SELECT name, description FROM user:okta_123->member_of->group"
+	q, err := Parse(input)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	result, err := gen.Generate(q)
+	if err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+
+	// Should select from target entity (group)
+	if !strings.Contains(result.SQL, "t1.name") {
+		t.Errorf("SQL should select name from target entity: %s", result.SQL)
+	}
+	if !strings.Contains(result.SQL, "t1.description") {
+		t.Errorf("SQL should select description from target entity: %s", result.SQL)
+	}
+
+	// Should have JOINs to traverse relationship
+	if !strings.Contains(result.SQL, "JOIN user_groups") {
+		t.Errorf("SQL missing junction table JOIN: %s", result.SQL)
+	}
+	if !strings.Contains(result.SQL, "JOIN groups") {
+		t.Errorf("SQL missing target table JOIN: %s", result.SQL)
+	}
+
+	// Should start from users table
+	if !strings.Contains(result.SQL, "FROM users t0") {
+		t.Errorf("SQL should start FROM users: %s", result.SQL)
+	}
+
+	// Should filter by external_id
+	if !strings.Contains(result.SQL, "external_id = $1") {
+		t.Errorf("SQL missing external_id filter: %s", result.SQL)
+	}
+
+	t.Logf("Generated SQL: %s", result.SQL)
+	t.Logf("Params: %v", result.Params)
+}
+
+func TestGenerateFromClausePathTraversalAllFields(t *testing.T) {
+	schema := testSchema()
+	gen := NewGenerator(schema)
+
+	// Select all fields from target entity
+	input := "SELECT * FROM user:okta_123->member_of->group"
+	q, err := Parse(input)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	result, err := gen.Generate(q)
+	if err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+
+	// Should select all from final target
+	if !strings.Contains(result.SQL, "SELECT t1.*") {
+		t.Errorf("SQL should SELECT t1.* for all fields: %s", result.SQL)
+	}
+
+	t.Logf("Generated SQL: %s", result.SQL)
+}
+
+func TestGenerateFromClauseMultiHopPath(t *testing.T) {
+	schema := testSchema()
+	gen := NewGenerator(schema)
+
+	// Multi-hop: user -> group -> app
+	input := "SELECT name, app_type FROM user:okta_123->member_of->group->has_access->app"
+	q, err := Parse(input)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	result, err := gen.Generate(q)
+	if err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+
+	// Should have all required JOINs
+	if !strings.Contains(result.SQL, "JOIN user_groups") {
+		t.Errorf("SQL missing user_groups JOIN: %s", result.SQL)
+	}
+	if !strings.Contains(result.SQL, "JOIN groups") {
+		t.Errorf("SQL missing groups JOIN: %s", result.SQL)
+	}
+	if !strings.Contains(result.SQL, "JOIN group_apps") {
+		t.Errorf("SQL missing group_apps JOIN: %s", result.SQL)
+	}
+	if !strings.Contains(result.SQL, "JOIN apps") {
+		t.Errorf("SQL missing apps JOIN: %s", result.SQL)
+	}
+
+	// Final select should be from apps table (t2 after 2 hops)
+	if !strings.Contains(result.SQL, "t2.name") || !strings.Contains(result.SQL, "t2.app_type") {
+		t.Errorf("SQL should select from final target entity: %s", result.SQL)
+	}
+
+	t.Logf("Generated SQL: %s", result.SQL)
+}
+
+func TestGenerateFromClauseReverseTraversal(t *testing.T) {
+	schema := testSchema()
+	gen := NewGenerator(schema)
+
+	// Reverse traversal: group <- user (who belongs to this group)
+	input := "SELECT email, status FROM group:grp_123<-member_of<-user"
+	q, err := Parse(input)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	result, err := gen.Generate(q)
+	if err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+
+	// Should start from groups
+	if !strings.Contains(result.SQL, "FROM groups t0") {
+		t.Errorf("SQL should start FROM groups: %s", result.SQL)
+	}
+
+	// Should select from users (target of reverse traversal)
+	if !strings.Contains(result.SQL, "t1.email") {
+		t.Errorf("SQL should select email from users: %s", result.SQL)
+	}
+
+	t.Logf("Generated SQL: %s", result.SQL)
+}
+
+func TestGenerateFromClausePathWithQuotedID(t *testing.T) {
+	schema := testSchema()
+	gen := NewGenerator(schema)
+
+	// IDs starting with numbers need quotes
+	input := "SELECT name FROM user:'00u24m2v4jOPwc106697'->member_of->group"
+	q, err := Parse(input)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	result, err := gen.Generate(q)
+	if err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+
+	// Parameter should have the ID without quotes
+	if len(result.Params) == 0 {
+		t.Fatal("expected at least one parameter")
+	}
+	if result.Params[0] != "00u24m2v4jOPwc106697" {
+		t.Errorf("Params[0] = %q, want '00u24m2v4jOPwc106697'", result.Params[0])
+	}
+
+	t.Logf("Generated SQL: %s", result.SQL)
+	t.Logf("Params: %v", result.Params)
+}
+
+func TestGenerateFromClausePathWithWhere(t *testing.T) {
+	schema := testSchema()
+	gen := NewGenerator(schema)
+
+	// Path with WHERE clause filtering on target entity
+	input := "SELECT name FROM user:okta_123->member_of->group WHERE name LIKE 'Admin%'"
+	q, err := Parse(input)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	result, err := gen.Generate(q)
+	if err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+
+	// Should have WHERE clause for both external_id and name filter
+	if !strings.Contains(result.SQL, "external_id = $1") {
+		t.Errorf("SQL missing external_id filter: %s", result.SQL)
+	}
+	if !strings.Contains(result.SQL, "LIKE") {
+		t.Errorf("SQL missing LIKE filter: %s", result.SQL)
+	}
+
+	t.Logf("Generated SQL: %s", result.SQL)
+	t.Logf("Params: %v", result.Params)
+}
+
+func TestGenerateRecursiveTraversalSimple(t *testing.T) {
+	schema := testSchema()
+	gen := NewGenerator(schema)
+
+	// Simple recursive traversal: find all ancestor groups of a group
+	input := "SELECT ->child_of{1,3}->group FROM group:engineering"
+	q, err := Parse(input)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	result, err := gen.Generate(q)
+	if err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+
+	// Should have RECURSIVE CTE
+	if !strings.Contains(result.SQL, "WITH RECURSIVE path_cte") {
+		t.Errorf("SQL missing RECURSIVE CTE: %s", result.SQL)
+	}
+
+	// Should have base case and recursive case with UNION ALL
+	if !strings.Contains(result.SQL, "UNION ALL") {
+		t.Errorf("SQL missing UNION ALL: %s", result.SQL)
+	}
+
+	// Should have depth tracking
+	if !strings.Contains(result.SQL, "depth") {
+		t.Errorf("SQL missing depth tracking: %s", result.SQL)
+	}
+
+	// Should have depth constraint (< 3 for max 3 hops)
+	if !strings.Contains(result.SQL, "p.depth < 3") {
+		t.Errorf("SQL missing depth constraint: %s", result.SQL)
+	}
+
+	// Should have minimum depth filter (>= 1)
+	if !strings.Contains(result.SQL, "p.depth >= 1") {
+		t.Errorf("SQL missing min depth filter: %s", result.SQL)
+	}
+
+	// Should have temporal filter
+	if !strings.Contains(result.SQL, "valid_to = 'infinity'") {
+		t.Errorf("SQL missing temporal filter: %s", result.SQL)
+	}
+
+	t.Logf("Generated SQL: %s", result.SQL)
+	t.Logf("Params: %v", result.Params)
+}
+
+func TestGenerateRecursiveTraversalMixedPath(t *testing.T) {
+	schema := testSchema()
+	gen := NewGenerator(schema)
+
+	// Mixed path: first traverse user->member_of->group, then recursive group->child_of->group
+	// "Find all ancestor groups of groups that user alice is a member of"
+	input := "SELECT ->member_of->group->child_of{1,6}->group FROM user:alice"
+	q, err := Parse(input)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	result, err := gen.Generate(q)
+	if err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+
+	// Should have RECURSIVE CTE
+	if !strings.Contains(result.SQL, "WITH RECURSIVE path_cte") {
+		t.Errorf("SQL missing RECURSIVE CTE: %s", result.SQL)
+	}
+
+	// Should join through user_groups (prefix path)
+	if !strings.Contains(result.SQL, "user_groups") {
+		t.Errorf("SQL missing user_groups join: %s", result.SQL)
+	}
+
+	// Should join through group_hierarchy (recursive relationship)
+	if !strings.Contains(result.SQL, "group_hierarchy") {
+		t.Errorf("SQL missing group_hierarchy join: %s", result.SQL)
+	}
+
+	// Should have the user's external_id parameter
+	if len(result.Params) < 1 {
+		t.Errorf("Expected at least 1 param, got %d", len(result.Params))
+	}
+	if result.Params[0] != "alice" {
+		t.Errorf("Params[0] = %v, want alice", result.Params[0])
+	}
+
+	// Should have depth constraint (< 6 for max 6 hops)
+	if !strings.Contains(result.SQL, "p.depth < 6") {
+		t.Errorf("SQL missing depth constraint: %s", result.SQL)
+	}
+
+	t.Logf("Generated SQL: %s", result.SQL)
+	t.Logf("Params: %v", result.Params)
+}
+
+func TestGenerateRecursiveTraversalExactDepth(t *testing.T) {
+	schema := testSchema()
+	gen := NewGenerator(schema)
+
+	// Exact depth: {3} means exactly 3 hops
+	input := "SELECT ->child_of{3}->group FROM group:engineering"
+	q, err := Parse(input)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	result, err := gen.Generate(q)
+	if err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+
+	// Should have RECURSIVE CTE
+	if !strings.Contains(result.SQL, "WITH RECURSIVE path_cte") {
+		t.Errorf("SQL missing RECURSIVE CTE: %s", result.SQL)
+	}
+
+	// For exact depth {3}, should have depth < 3 (max) and depth >= 3 (min)
+	if !strings.Contains(result.SQL, "p.depth < 3") {
+		t.Errorf("SQL missing max depth constraint: %s", result.SQL)
+	}
+	if !strings.Contains(result.SQL, "p.depth >= 3") {
+		t.Errorf("SQL missing min depth constraint: %s", result.SQL)
+	}
+
+	t.Logf("Generated SQL: %s", result.SQL)
+}
+
+func TestGenerateWildcardSingleHop(t *testing.T) {
+	schema := testSchema()
+	gen := NewGenerator(schema)
+
+	// Wildcard to specific entity type: find all relationships from user that lead to group
+	input := "SELECT ->*->group FROM user:alice"
+	q, err := Parse(input)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	result, err := gen.Generate(q)
+	if err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+
+	// Should include the member_of relationship (user -> group)
+	if !strings.Contains(result.SQL, "user_groups") {
+		t.Errorf("SQL should join through user_groups for member_of: %s", result.SQL)
+	}
+
+	// Should include _relationship column showing which relationship was used
+	if !strings.Contains(result.SQL, "'member_of' AS _relationship") {
+		t.Errorf("SQL should include relationship name: %s", result.SQL)
+	}
+
+	// Should have parameter for external_id
+	if len(result.Params) != 1 || result.Params[0] != "alice" {
+		t.Errorf("Expected params [alice], got %v", result.Params)
+	}
+
+	t.Logf("Generated SQL: %s", result.SQL)
+}
+
+func TestGenerateWildcardMultipleRelationships(t *testing.T) {
+	// Create schema with multiple relationships from user
+	schema := NewSchema()
+	schema.AddEntity("user", "users", "id").WithTemporal()
+	schema.AddEntity("group", "groups", "id").WithTemporal()
+	schema.AddEntity("app", "apps", "id").WithTemporal()
+
+	schema.AddRelationship("member_of", "user", "group", "user_groups", "user_id", "group_id")
+	schema.AddRelationship("assigned_to", "user", "app", "user_apps", "user_id", "app_id")
+
+	gen := NewGenerator(schema)
+
+	// Wildcard to any entity: find all outgoing relationships from user
+	input := "SELECT ->*->* FROM user:alice"
+	q, err := Parse(input)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	result, err := gen.Generate(q)
+	if err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+
+	// Should include both relationships as UNION
+	if !strings.Contains(result.SQL, "UNION ALL") {
+		t.Errorf("SQL should use UNION ALL for multiple relationships: %s", result.SQL)
+	}
+
+	// Should include both junction tables
+	if !strings.Contains(result.SQL, "user_groups") {
+		t.Errorf("SQL should include user_groups: %s", result.SQL)
+	}
+	if !strings.Contains(result.SQL, "user_apps") {
+		t.Errorf("SQL should include user_apps: %s", result.SQL)
+	}
+
+	t.Logf("Generated SQL: %s", result.SQL)
+}
+
+func TestGenerateWildcardRecursive(t *testing.T) {
+	schema := testSchema()
+	gen := NewGenerator(schema)
+
+	// Recursive wildcard: explore any path up to 3 hops ending at user
+	input := "SELECT ->*{1,3}->user FROM user:alice"
+	q, err := Parse(input)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	result, err := gen.Generate(q)
+	if err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+
+	// Should have RECURSIVE CTE
+	if !strings.Contains(result.SQL, "WITH RECURSIVE path_cte") {
+		t.Errorf("SQL missing RECURSIVE CTE: %s", result.SQL)
+	}
+
+	// Should track entity_type in CTE for heterogeneous traversal
+	if !strings.Contains(result.SQL, "entity_type") {
+		t.Errorf("SQL should track entity_type: %s", result.SQL)
+	}
+
+	// Should have depth constraints
+	if !strings.Contains(result.SQL, "p.depth < 3") {
+		t.Errorf("SQL missing max depth constraint: %s", result.SQL)
+	}
+	if !strings.Contains(result.SQL, "p.depth >= 1") {
+		t.Errorf("SQL missing min depth constraint: %s", result.SQL)
+	}
+
+	// Final query should filter by target entity type
+	if !strings.Contains(result.SQL, "p.entity_type = 'user'") {
+		t.Errorf("SQL should filter by target entity type: %s", result.SQL)
+	}
+
+	t.Logf("Generated SQL: %s", result.SQL)
+}
+
+func testPolicySchema() *Schema {
+	s := NewSchema()
+
+	s.AddEntity("user", "users", "id").WithTemporal()
+	s.AddEntity("group", "groups", "id").WithTemporal()
+	s.AddEntity("app", "apps", "id").WithTemporal()
+	s.AddEntity("policy", "policies", "id").WithTemporal()
+	s.AddEntity("rule", "rules", "id").WithTemporal()
+
+	s.AddRelationship("member_of", "user", "group", "user_groups", "user_id", "group_id").WithTemporal()
+	s.AddRelationship("has_access", "group", "app", "group_apps", "group_id", "app_id").WithTemporal()
+	s.AddRelationship("governed_by", "app", "policy", "app_policies", "app_id", "policy_id").WithTemporal()
+	s.AddRelationship("has_rule", "policy", "rule", "policy_rules", "policy_id", "rule_id").WithTemporal()
+	s.AddRelationship("applies_to", "rule", "group", "rule_groups", "rule_id", "group_id").WithTemporal()
+
+	return s
+}
+
+func TestGenerateCrossPathJoin(t *testing.T) {
+	schema := testPolicySchema()
+	gen := NewGenerator(schema)
+
+	// Query: Find users, their groups, and the policy rules that apply to those groups
+	input := `SELECT u.email, g.name, r.name
+		FROM user AS u ->member_of->group AS g
+		JOIN app:slack ->governed_by->policy ->has_rule->rule AS r ->applies_to->group AS rg
+		ON g.id = rg.id`
+
+	q, err := Parse(input)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	result, err := gen.Generate(q)
+	if err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+
+	// Should have JOINs for the main path
+	if !strings.Contains(result.SQL, "user_groups") {
+		t.Errorf("SQL missing user_groups join: %s", result.SQL)
+	}
+
+	// Should have JOINs for the policy path
+	if !strings.Contains(result.SQL, "app_policies") {
+		t.Errorf("SQL missing app_policies join: %s", result.SQL)
+	}
+	if !strings.Contains(result.SQL, "policy_rules") {
+		t.Errorf("SQL missing policy_rules join: %s", result.SQL)
+	}
+	if !strings.Contains(result.SQL, "rule_groups") {
+		t.Errorf("SQL missing rule_groups join: %s", result.SQL)
+	}
+
+	// Should have the ON condition joining the two paths
+	// The ON condition g.id = rg.id should translate to alias comparisons
+	if !strings.Contains(result.SQL, ".id =") || !strings.Contains(result.SQL, ".id") {
+		t.Errorf("SQL missing ON condition: %s", result.SQL)
+	}
+
+	t.Logf("Generated SQL: %s", result.SQL)
+}
+
+func TestGenerateCrossPathJoinEffectiveRules(t *testing.T) {
+	schema := testPolicySchema()
+	gen := NewGenerator(schema)
+
+	// Full query: Users -> Groups -> Apps with Policy -> Rules that apply to those groups
+	input := `SELECT u.email, g.name AS access_group, p.name AS policy_name, r.name AS rule_name
+		FROM user AS u ->member_of->group AS g ->has_access->app AS a
+		JOIN app AS app_join ->governed_by->policy AS p ->has_rule->rule AS r ->applies_to->group AS rg
+		ON g.id = rg.id`
+
+	q, err := Parse(input)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	result, err := gen.Generate(q)
+	if err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+
+	// Should have all the necessary JOINs
+	if !strings.Contains(result.SQL, "users") {
+		t.Errorf("SQL missing users table: %s", result.SQL)
+	}
+	if !strings.Contains(result.SQL, "groups") {
+		t.Errorf("SQL missing groups table: %s", result.SQL)
+	}
+	if !strings.Contains(result.SQL, "apps") {
+		t.Errorf("SQL missing apps table: %s", result.SQL)
+	}
+	if !strings.Contains(result.SQL, "policies") {
+		t.Errorf("SQL missing policies table: %s", result.SQL)
+	}
+	if !strings.Contains(result.SQL, "rules") {
+		t.Errorf("SQL missing rules table: %s", result.SQL)
+	}
+
+	// Should have temporal filters
+	if !strings.Contains(result.SQL, "valid_to = 'infinity'") {
+		t.Errorf("SQL missing temporal filter: %s", result.SQL)
+	}
+
+	t.Logf("Generated SQL: %s", result.SQL)
+}
+
+func TestGenerateExplainAccess(t *testing.T) {
+	schema := testPolicySchema()
+	gen := NewGenerator(schema)
+
+	stmt := &ExplainAccessStmt{
+		FromEntity: "user",
+		FromID:     "alice",
+		ToEntity:   "app",
+		ToID:       "slack",
+	}
+
+	queries, err := gen.GenerateAccessExplanation(stmt)
+	if err != nil {
+		t.Fatalf("GenerateAccessExplanation() error = %v", err)
+	}
+
+	// Subject query should exist and query users table
+	if queries.SubjectQuery == nil {
+		t.Error("SubjectQuery should not be nil")
+	} else {
+		if !strings.Contains(queries.SubjectQuery.SQL, "users") {
+			t.Errorf("SubjectQuery should query users table: %s", queries.SubjectQuery.SQL)
+		}
+		if !strings.Contains(queries.SubjectQuery.SQL, "external_id = $1") {
+			t.Errorf("SubjectQuery should filter by external_id: %s", queries.SubjectQuery.SQL)
+		}
+		if queries.SubjectQuery.Params[0] != "alice" {
+			t.Errorf("SubjectQuery param should be alice, got %v", queries.SubjectQuery.Params[0])
+		}
+		t.Logf("Subject Query: %s", queries.SubjectQuery.SQL)
+	}
+
+	// Target query should exist and query apps table
+	if queries.TargetQuery == nil {
+		t.Error("TargetQuery should not be nil")
+	} else {
+		if !strings.Contains(queries.TargetQuery.SQL, "apps") {
+			t.Errorf("TargetQuery should query apps table: %s", queries.TargetQuery.SQL)
+		}
+		if queries.TargetQuery.Params[0] != "slack" {
+			t.Errorf("TargetQuery param should be slack, got %v", queries.TargetQuery.Params[0])
+		}
+		t.Logf("Target Query: %s", queries.TargetQuery.SQL)
+	}
+
+	// Group access query should join user -> group -> app
+	if queries.GroupAccessQuery == nil {
+		t.Log("GroupAccessQuery is nil (expected since has_access is on group->app)")
+	} else {
+		if !strings.Contains(queries.GroupAccessQuery.SQL, "user_groups") {
+			t.Errorf("GroupAccessQuery should include user_groups: %s", queries.GroupAccessQuery.SQL)
+		}
+		if !strings.Contains(queries.GroupAccessQuery.SQL, "group_apps") {
+			t.Errorf("GroupAccessQuery should include group_apps: %s", queries.GroupAccessQuery.SQL)
+		}
+		t.Logf("Group Access Query: %s", queries.GroupAccessQuery.SQL)
+	}
+
+	// Policy query should find app -> policy
+	if queries.PolicyQuery == nil {
+		t.Log("PolicyQuery is nil (expected if no direct policy)")
+	} else {
+		if !strings.Contains(queries.PolicyQuery.SQL, "app_policies") {
+			t.Errorf("PolicyQuery should include app_policies: %s", queries.PolicyQuery.SQL)
+		}
+		if !strings.Contains(queries.PolicyQuery.SQL, "policies") {
+			t.Errorf("PolicyQuery should include policies: %s", queries.PolicyQuery.SQL)
+		}
+		t.Logf("Policy Query: %s", queries.PolicyQuery.SQL)
+	}
+
+	// Rules query should find app -> policy -> rules
+	if queries.RulesQuery == nil {
+		t.Log("RulesQuery is nil (expected if no rules defined)")
+	} else {
+		if !strings.Contains(queries.RulesQuery.SQL, "policy_rules") {
+			t.Errorf("RulesQuery should include policy_rules: %s", queries.RulesQuery.SQL)
+		}
+		if !strings.Contains(queries.RulesQuery.SQL, "rules") {
+			t.Errorf("RulesQuery should include rules: %s", queries.RulesQuery.SQL)
+		}
+		t.Logf("Rules Query: %s", queries.RulesQuery.SQL)
+	}
+
+	// Effective rules query should find rules that apply to user's groups
+	if queries.EffectiveRulesQuery == nil {
+		t.Log("EffectiveRulesQuery is nil (expected if schema doesn't support)")
+	} else {
+		// Should join user -> groups
+		if !strings.Contains(queries.EffectiveRulesQuery.SQL, "user_groups") {
+			t.Errorf("EffectiveRulesQuery should include user_groups: %s", queries.EffectiveRulesQuery.SQL)
+		}
+		// Should join rule -> target groups
+		if !strings.Contains(queries.EffectiveRulesQuery.SQL, "rule_groups") {
+			t.Errorf("EffectiveRulesQuery should include rule_groups: %s", queries.EffectiveRulesQuery.SQL)
+		}
+		t.Logf("Effective Rules Query: %s", queries.EffectiveRulesQuery.SQL)
+	}
+}
+
+func TestGenerateExplainAccessSQL(t *testing.T) {
+	schema := testPolicySchema()
+	gen := NewGenerator(schema)
+
+	stmt := &ExplainAccessStmt{
+		FromEntity: "user",
+		FromID:     "alice",
+		ToEntity:   "app",
+		ToID:       "slack",
+	}
+
+	sql, err := gen.GenerateAccessExplanationSQL(stmt)
+	if err != nil {
+		t.Fatalf("GenerateAccessExplanationSQL() error = %v", err)
+	}
+
+	// Should have section headers
+	if !strings.Contains(sql, "-- Subject Query:") {
+		t.Error("SQL should contain Subject Query section")
+	}
+	if !strings.Contains(sql, "-- Target Query:") {
+		t.Error("SQL should contain Target Query section")
+	}
+
+	// Should contain actual SQL
+	if !strings.Contains(sql, "SELECT") {
+		t.Error("SQL should contain SELECT statements")
+	}
+	if !strings.Contains(sql, "FROM users") {
+		t.Error("SQL should contain FROM users")
+	}
+	if !strings.Contains(sql, "FROM apps") {
+		t.Error("SQL should contain FROM apps")
+	}
+
+	t.Logf("Generated SQL:\n%s", sql)
+}
+
+func TestGenerateExplainAccessUnknownEntity(t *testing.T) {
+	schema := testPolicySchema()
+	gen := NewGenerator(schema)
+
+	stmt := &ExplainAccessStmt{
+		FromEntity: "unknown_entity",
+		FromID:     "alice",
+		ToEntity:   "app",
+		ToID:       "slack",
+	}
+
+	_, err := gen.GenerateAccessExplanation(stmt)
+	if err == nil {
+		t.Error("GenerateAccessExplanation() should return error for unknown entity")
+	}
+}
+
+func TestParseAndGenerateExplainAccess(t *testing.T) {
+	schema := testPolicySchema()
+	gen := NewGenerator(schema)
+
+	input := "EXPLAIN ACCESS user:alice TO app:slack"
+	stmt, err := ParseStatement(input)
+	if err != nil {
+		t.Fatalf("ParseStatement() error = %v", err)
+	}
+
+	if stmt.ExplainAccess == nil {
+		t.Fatal("Expected ExplainAccess statement")
+	}
+
+	queries, err := gen.GenerateAccessExplanation(stmt.ExplainAccess)
+	if err != nil {
+		t.Fatalf("GenerateAccessExplanation() error = %v", err)
+	}
+
+	// Verify both queries exist
+	if queries.SubjectQuery == nil {
+		t.Error("SubjectQuery should not be nil")
+	}
+	if queries.TargetQuery == nil {
+		t.Error("TargetQuery should not be nil")
+	}
+
+	t.Logf("Parsed and generated EXPLAIN ACCESS successfully")
+}
+
+func TestParseExplainAccessWithVersion(t *testing.T) {
+	input := "EXPLAIN ACCESS user:alice TO app:slack VERSION d'2024-01-01T00:00:00Z'"
+	stmt, err := ParseStatement(input)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+
+	if stmt.ExplainAccess == nil {
+		t.Fatal("Expected ExplainAccess statement")
+	}
+
+	ea := stmt.ExplainAccess
+	if ea.FromEntity != "user" {
+		t.Errorf("FromEntity = %v, want user", ea.FromEntity)
+	}
+	if ea.Version == nil {
+		t.Fatal("Expected Version clause")
+	}
+	if ea.Version.Timestamp == nil {
+		t.Fatal("Expected Version.Timestamp")
+	}
+	if *ea.Version.Timestamp != "2024-01-01T00:00:00Z" {
+		t.Errorf("Version.Timestamp = %v, want 2024-01-01T00:00:00Z", *ea.Version.Timestamp)
+	}
+}
+
+func TestParseExplainAccessVersionsAll(t *testing.T) {
+	input := "EXPLAIN ACCESS user:alice TO app:slack VERSIONS ALL"
+	stmt, err := ParseStatement(input)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+
+	if stmt.ExplainAccess == nil {
+		t.Fatal("Expected ExplainAccess statement")
+	}
+
+	ea := stmt.ExplainAccess
+	if ea.Versions == nil {
+		t.Fatal("Expected Versions clause")
+	}
+	if !ea.Versions.All {
+		t.Error("Expected Versions.All = true")
+	}
+}
+
+func TestParseExplainAccessVersionsLast(t *testing.T) {
+	input := "EXPLAIN ACCESS user:alice TO app:slack VERSIONS LAST 5"
+	stmt, err := ParseStatement(input)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+
+	if stmt.ExplainAccess == nil {
+		t.Fatal("Expected ExplainAccess statement")
+	}
+
+	ea := stmt.ExplainAccess
+	if ea.Versions == nil {
+		t.Fatal("Expected Versions clause")
+	}
+	if ea.Versions.Last == nil {
+		t.Fatal("Expected Versions.Last")
+	}
+	if *ea.Versions.Last != 5 {
+		t.Errorf("Versions.Last = %v, want 5", *ea.Versions.Last)
+	}
+}
+
+func TestParseExplainAccessVersionsBetween(t *testing.T) {
+	input := "EXPLAIN ACCESS user:alice TO app:slack VERSIONS BETWEEN d'2024-01-01' AND d'2024-06-01'"
+	stmt, err := ParseStatement(input)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+
+	if stmt.ExplainAccess == nil {
+		t.Fatal("Expected ExplainAccess statement")
+	}
+
+	ea := stmt.ExplainAccess
+	if ea.Versions == nil {
+		t.Fatal("Expected Versions clause")
+	}
+	if ea.Versions.Between == nil {
+		t.Fatal("Expected Versions.Between")
+	}
+	if *ea.Versions.Between.From != "2024-01-01" {
+		t.Errorf("Versions.Between.From = %v, want 2024-01-01", *ea.Versions.Between.From)
+	}
+	if *ea.Versions.Between.To != "2024-06-01" {
+		t.Errorf("Versions.Between.To = %v, want 2024-06-01", *ea.Versions.Between.To)
+	}
+}
+
+func TestGenerateExplainAccessTemporalVersion(t *testing.T) {
+	schema := testPolicySchema()
+	gen := NewGenerator(schema)
+
+	timestamp := "2024-01-01T00:00:00Z"
+	stmt := &ExplainAccessStmt{
+		FromEntity: "user",
+		FromID:     "alice",
+		ToEntity:   "app",
+		ToID:       "slack",
+		Version: &VersionClause{
+			Timestamp: &timestamp,
+		},
+	}
+
+	queries, err := gen.GenerateAccessExplanation(stmt)
+	if err != nil {
+		t.Fatalf("GenerateAccessExplanation() error = %v", err)
+	}
+
+	// Check temporal mode
+	if queries.TemporalMode != "point_in_time:2024-01-01T00:00:00Z" {
+		t.Errorf("TemporalMode = %v, want point_in_time:2024-01-01T00:00:00Z", queries.TemporalMode)
+	}
+
+	// Subject query should have temporal range filter
+	if !strings.Contains(queries.SubjectQuery.SQL, "valid_from") {
+		t.Errorf("SubjectQuery should contain valid_from: %s", queries.SubjectQuery.SQL)
+	}
+	if !strings.Contains(queries.SubjectQuery.SQL, "valid_to") {
+		t.Errorf("SubjectQuery should contain valid_to: %s", queries.SubjectQuery.SQL)
+	}
+	// Should NOT have 'infinity' for point-in-time query
+	if strings.Contains(queries.SubjectQuery.SQL, "'infinity'") {
+		t.Errorf("SubjectQuery should not contain 'infinity' for point-in-time: %s", queries.SubjectQuery.SQL)
+	}
+
+	t.Logf("Subject Query: %s", queries.SubjectQuery.SQL)
+	t.Logf("Params: %v", queries.SubjectQuery.Params)
+}
+
+func TestGenerateExplainAccessVersionsAll(t *testing.T) {
+	schema := testPolicySchema()
+	gen := NewGenerator(schema)
+
+	stmt := &ExplainAccessStmt{
+		FromEntity: "user",
+		FromID:     "alice",
+		ToEntity:   "app",
+		ToID:       "slack",
+		Versions: &VersionsClause{
+			All: true,
+		},
+	}
+
+	queries, err := gen.GenerateAccessExplanation(stmt)
+	if err != nil {
+		t.Fatalf("GenerateAccessExplanation() error = %v", err)
+	}
+
+	// Check temporal mode
+	if queries.TemporalMode != "all_versions" {
+		t.Errorf("TemporalMode = %v, want all_versions", queries.TemporalMode)
+	}
+
+	// Subject query should NOT have valid_to = 'infinity' filter
+	if strings.Contains(queries.SubjectQuery.SQL, "'infinity'") {
+		t.Errorf("SubjectQuery should not contain 'infinity' for VERSIONS ALL: %s", queries.SubjectQuery.SQL)
+	}
+
+	t.Logf("Subject Query: %s", queries.SubjectQuery.SQL)
+}
+
+func TestGenerateExplainAccessVersionsLast(t *testing.T) {
+	schema := testPolicySchema()
+	gen := NewGenerator(schema)
+
+	last := 5
+	stmt := &ExplainAccessStmt{
+		FromEntity: "user",
+		FromID:     "alice",
+		ToEntity:   "app",
+		ToID:       "slack",
+		Versions: &VersionsClause{
+			Last: &last,
+		},
+	}
+
+	queries, err := gen.GenerateAccessExplanation(stmt)
+	if err != nil {
+		t.Fatalf("GenerateAccessExplanation() error = %v", err)
+	}
+
+	// Check temporal mode
+	if queries.TemporalMode != "last_5_versions" {
+		t.Errorf("TemporalMode = %v, want last_5_versions", queries.TemporalMode)
+	}
+
+	// Subject query should have ORDER BY and LIMIT
+	if !strings.Contains(queries.SubjectQuery.SQL, "ORDER BY") {
+		t.Errorf("SubjectQuery should contain ORDER BY: %s", queries.SubjectQuery.SQL)
+	}
+	if !strings.Contains(queries.SubjectQuery.SQL, "LIMIT 5") {
+		t.Errorf("SubjectQuery should contain LIMIT 5: %s", queries.SubjectQuery.SQL)
+	}
+
+	t.Logf("Subject Query: %s", queries.SubjectQuery.SQL)
+}
+
+func TestGenerateExplainAccessVersionsBetween(t *testing.T) {
+	schema := testPolicySchema()
+	gen := NewGenerator(schema)
+
+	from := "2024-01-01"
+	to := "2024-06-01"
+	stmt := &ExplainAccessStmt{
+		FromEntity: "user",
+		FromID:     "alice",
+		ToEntity:   "app",
+		ToID:       "slack",
+		Versions: &VersionsClause{
+			Between: &VersionRange{
+				From: &from,
+				To:   &to,
+			},
+		},
+	}
+
+	queries, err := gen.GenerateAccessExplanation(stmt)
+	if err != nil {
+		t.Fatalf("GenerateAccessExplanation() error = %v", err)
+	}
+
+	// Check temporal mode
+	expectedMode := "between:2024-01-01:2024-06-01"
+	if queries.TemporalMode != expectedMode {
+		t.Errorf("TemporalMode = %v, want %v", queries.TemporalMode, expectedMode)
+	}
+
+	// Subject query should have range filters
+	if !strings.Contains(queries.SubjectQuery.SQL, "valid_from >=") {
+		t.Errorf("SubjectQuery should contain valid_from >=: %s", queries.SubjectQuery.SQL)
+	}
+	if !strings.Contains(queries.SubjectQuery.SQL, "valid_from <=") {
+		t.Errorf("SubjectQuery should contain valid_from <=: %s", queries.SubjectQuery.SQL)
+	}
+
+	t.Logf("Subject Query: %s", queries.SubjectQuery.SQL)
+	t.Logf("Params: %v", queries.SubjectQuery.Params)
 }

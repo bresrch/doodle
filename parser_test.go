@@ -1868,3 +1868,798 @@ func TestParseStatementSelect(t *testing.T) {
 		t.Errorf("Entity = %v, want user", stmt.Select.From.Entity)
 	}
 }
+
+// ============================================================================
+// New Doodle Syntax Tests (SurrealDB+ inspired)
+// ============================================================================
+
+func TestParseBidirectionalTraversal(t *testing.T) {
+	input := "SELECT <->friends_with<->user FROM user:alice"
+	q, err := Parse(input)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	if q.Select.Path == nil {
+		t.Fatal("Path is nil")
+	}
+
+	if len(q.Select.Path.Traversals) != 2 {
+		t.Fatalf("len(Traversals) = %d, want 2", len(q.Select.Path.Traversals))
+	}
+
+	// First traversal should be bidirectional
+	if q.Select.Path.Traversals[0].Direction != "<->" {
+		t.Errorf("Traversals[0].Direction = %v, want <->", q.Select.Path.Traversals[0].Direction)
+	}
+	if !q.Select.Path.Traversals[0].IsBidirectional() {
+		t.Error("Traversals[0] should be bidirectional")
+	}
+	if q.Select.Path.Traversals[0].BaseDirection() != "<->" {
+		t.Errorf("Traversals[0].BaseDirection() = %v, want <->", q.Select.Path.Traversals[0].BaseDirection())
+	}
+	if q.Select.Path.Traversals[0].Target != "friends_with" {
+		t.Errorf("Traversals[0].Target = %v, want friends_with", q.Select.Path.Traversals[0].Target)
+	}
+
+	// Second traversal should also be bidirectional
+	if q.Select.Path.Traversals[1].Direction != "<->" {
+		t.Errorf("Traversals[1].Direction = %v, want <->", q.Select.Path.Traversals[1].Direction)
+	}
+	if q.Select.Path.Traversals[1].Target != "user" {
+		t.Errorf("Traversals[1].Target = %v, want user", q.Select.Path.Traversals[1].Target)
+	}
+}
+
+func TestParsePrefixOptionalTraversal(t *testing.T) {
+	input := "SELECT ?->member_of->group FROM user:alice"
+	q, err := Parse(input)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	if q.Select.Path == nil {
+		t.Fatal("Path is nil")
+	}
+
+	if len(q.Select.Path.Traversals) != 2 {
+		t.Fatalf("len(Traversals) = %d, want 2", len(q.Select.Path.Traversals))
+	}
+
+	// First traversal should be prefix optional
+	if q.Select.Path.Traversals[0].Direction != "?->" {
+		t.Errorf("Traversals[0].Direction = %v, want ?->", q.Select.Path.Traversals[0].Direction)
+	}
+	if !q.Select.Path.Traversals[0].IsOptional() {
+		t.Error("Traversals[0] should be optional")
+	}
+	if q.Select.Path.Traversals[0].BaseDirection() != "->" {
+		t.Errorf("Traversals[0].BaseDirection() = %v, want ->", q.Select.Path.Traversals[0].BaseDirection())
+	}
+}
+
+func TestParsePrefixNegationTraversal(t *testing.T) {
+	input := "SELECT * FROM user:alice WHERE !->member_of->group.name = 'admins'"
+	q, err := Parse(input)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	if q.Where == nil {
+		t.Fatal("Where is nil")
+	}
+
+	cond := q.Where.Or[0].Conditions[0]
+	if len(cond.Left.Path) != 2 {
+		t.Fatalf("len(Path) = %d, want 2", len(cond.Left.Path))
+	}
+
+	// First traversal should be prefix negation
+	if cond.Left.Path[0].Direction != "!->" {
+		t.Errorf("Path[0].Direction = %v, want !->", cond.Left.Path[0].Direction)
+	}
+	if !cond.Left.Path[0].IsNegated() {
+		t.Error("Path[0] should be negated")
+	}
+	if cond.Left.Path[0].BaseDirection() != "->" {
+		t.Errorf("Path[0].BaseDirection() = %v, want ->", cond.Left.Path[0].BaseDirection())
+	}
+}
+
+func TestParseVersionsAll(t *testing.T) {
+	input := "SELECT * FROM user:alice VERSIONS ALL"
+	q, err := Parse(input)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	if q.Versions == nil {
+		t.Fatal("Versions is nil")
+	}
+
+	if !q.Versions.All {
+		t.Error("Versions.All should be true")
+	}
+}
+
+func TestParseVersionsLast(t *testing.T) {
+	input := "SELECT * FROM user:alice VERSIONS LAST 5"
+	q, err := Parse(input)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	if q.Versions == nil {
+		t.Fatal("Versions is nil")
+	}
+
+	if q.Versions.Last == nil || *q.Versions.Last != 5 {
+		t.Errorf("Versions.Last = %v, want 5", q.Versions.Last)
+	}
+}
+
+func TestParseVersionsBetween(t *testing.T) {
+	input := "SELECT * FROM user:alice VERSIONS BETWEEN d'2024-01-01T00:00:00Z' AND d'2024-06-01T00:00:00Z'"
+	q, err := Parse(input)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	if q.Versions == nil {
+		t.Fatal("Versions is nil")
+	}
+
+	if q.Versions.Between == nil {
+		t.Fatal("Versions.Between is nil")
+	}
+
+	if q.Versions.Between.From == nil || *q.Versions.Between.From != "2024-01-01T00:00:00Z" {
+		t.Errorf("Versions.Between.From = %v, want 2024-01-01T00:00:00Z", q.Versions.Between.From)
+	}
+
+	if q.Versions.Between.To == nil || *q.Versions.Between.To != "2024-06-01T00:00:00Z" {
+		t.Errorf("Versions.Between.To = %v, want 2024-06-01T00:00:00Z", q.Versions.Between.To)
+	}
+}
+
+func TestParseTraversalAlias(t *testing.T) {
+	input := "SELECT ->member_of AS m->group FROM user:alice"
+	q, err := Parse(input)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	if q.Select.Path == nil {
+		t.Fatal("Path is nil")
+	}
+
+	if len(q.Select.Path.Traversals) != 2 {
+		t.Fatalf("len(Traversals) = %d, want 2", len(q.Select.Path.Traversals))
+	}
+
+	// First traversal should have alias
+	if q.Select.Path.Traversals[0].Alias != "m" {
+		t.Errorf("Traversals[0].Alias = %v, want m", q.Select.Path.Traversals[0].Alias)
+	}
+}
+
+// ============================================================================
+// Department Membership Query Tests
+// ============================================================================
+
+func TestParseCTEWithDepartmentFilter(t *testing.T) {
+	// CTE with simple WHERE clause (JSON_TEXT would be handled by generator)
+	input := "WITH engineering_users AS (SELECT * FROM user WHERE department = 'Engineering') SELECT * FROM engineering_users"
+
+	q, err := Parse(input)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	// Verify CTE
+	if len(q.With) != 1 {
+		t.Fatalf("Expected 1 CTE, got %d", len(q.With))
+	}
+
+	if q.With[0].Name != "engineering_users" {
+		t.Errorf("CTE name = %v, want engineering_users", q.With[0].Name)
+	}
+
+	// Verify CTE query has WHERE clause
+	cteQuery := q.With[0].Query
+	if cteQuery.Where == nil {
+		t.Fatal("CTE query should have WHERE clause")
+	}
+
+	// Verify main query references CTE
+	if q.From.Entity != "engineering_users" {
+		t.Errorf("Main query FROM = %v, want engineering_users", q.From.Entity)
+	}
+}
+
+func TestParseCTEWithTraversal(t *testing.T) {
+	// CTE referencing traversal in main query
+	input := "WITH dept_users AS (SELECT * FROM user WHERE status = 'active') SELECT ->member_of->group FROM dept_users"
+
+	q, err := Parse(input)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	if len(q.With) != 1 {
+		t.Fatalf("Expected 1 CTE, got %d", len(q.With))
+	}
+
+	// Main query should have path traversal
+	if q.Select.Path == nil {
+		t.Fatal("Main query should have path traversal")
+	}
+
+	if len(q.Select.Path.Traversals) != 2 {
+		t.Fatalf("Expected 2 traversals, got %d", len(q.Select.Path.Traversals))
+	}
+}
+
+func TestParseDirectIndirectMembershipUnion(t *testing.T) {
+	// UNION ALL with different field selections
+	input := "SELECT email FROM user UNION ALL SELECT email FROM user"
+
+	q, err := Parse(input)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	// Verify first query has email field
+	if len(q.Select.Fields) != 1 {
+		t.Fatalf("First query expected 1 field, got %d", len(q.Select.Fields))
+	}
+
+	// Verify UNION ALL compound
+	if len(q.Compound) != 1 {
+		t.Fatalf("Expected 1 compound part, got %d", len(q.Compound))
+	}
+
+	if q.Compound[0].Operator != "UNIONALL" {
+		t.Errorf("Operator = %v, want UNIONALL", q.Compound[0].Operator)
+	}
+}
+
+func TestParseCaseDirectIndirect(t *testing.T) {
+	input := "SELECT email, CASE WHEN parent_group IS NULL THEN 'direct' ELSE 'indirect' END AS assignment_type FROM user"
+
+	q, err := Parse(input)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	if len(q.Select.Fields) != 2 {
+		t.Fatalf("Expected 2 fields, got %d", len(q.Select.Fields))
+	}
+
+	// Second field should be CASE expression
+	if q.Select.Fields[1].Case == nil {
+		t.Fatal("Expected CASE expression in second field")
+	}
+
+	if q.Select.Fields[1].Alias != "assignment_type" {
+		t.Errorf("Alias = %v, want assignment_type", q.Select.Fields[1].Alias)
+	}
+
+	// Verify CASE has WHEN and ELSE
+	caseExpr := q.Select.Fields[1].Case
+	if len(caseExpr.Whens) != 1 {
+		t.Errorf("Expected 1 WHEN clause, got %d", len(caseExpr.Whens))
+	}
+
+	if caseExpr.Else == nil {
+		t.Error("Expected ELSE clause")
+	}
+}
+
+func TestParseNestedGroupTraversal(t *testing.T) {
+	// Query to find indirect group memberships through child_of relationship
+	// "Engineering Team" is child_of "All Engineering"
+	input := "SELECT ->member_of->group->child_of->group FROM user:alice"
+
+	q, err := Parse(input)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	if q.Select.Path == nil {
+		t.Fatal("Path is nil")
+	}
+
+	// Should have 4 traversals: member_of, group, child_of, group
+	if len(q.Select.Path.Traversals) != 4 {
+		t.Fatalf("Expected 4 traversals, got %d", len(q.Select.Path.Traversals))
+	}
+
+	// Verify traversal targets
+	expected := []string{"member_of", "group", "child_of", "group"}
+	for i, exp := range expected {
+		if q.Select.Path.Traversals[i].Target != exp {
+			t.Errorf("Traversals[%d].Target = %v, want %v", i, q.Select.Path.Traversals[i].Target, exp)
+		}
+	}
+}
+
+func TestParseFieldWithJSONFunction(t *testing.T) {
+	// JSON_TEXT as a SELECT field (not in WHERE)
+	// Note: 'meta' is a keyword, so use 'metadata' as the field name
+	input := "SELECT JSON_TEXT(metadata, 'department') AS department FROM user"
+
+	q, err := Parse(input)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	if len(q.Select.Fields) != 1 {
+		t.Fatalf("Expected 1 field, got %d", len(q.Select.Fields))
+	}
+
+	// Should have function call
+	if q.Select.Fields[0].FuncCall == nil {
+		t.Fatal("Expected function call")
+	}
+
+	if q.Select.Fields[0].FuncCall.Name != "JSON_TEXT" {
+		t.Errorf("Function name = %v, want JSON_TEXT", q.Select.Fields[0].FuncCall.Name)
+	}
+
+	if q.Select.Fields[0].Alias != "department" {
+		t.Errorf("Alias = %v, want department", q.Select.Fields[0].Alias)
+	}
+}
+
+func TestParseMultipleCTEsWithMembership(t *testing.T) {
+	// Multiple CTEs with UNION
+	input := "WITH active AS (SELECT * FROM user WHERE status = 'active'), admins AS (SELECT * FROM user WHERE role = 'admin') SELECT * FROM active UNION SELECT * FROM admins"
+
+	q, err := Parse(input)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	// Verify 2 CTEs
+	if len(q.With) != 2 {
+		t.Fatalf("Expected 2 CTEs, got %d", len(q.With))
+	}
+
+	expectedNames := []string{"active", "admins"}
+	for i, name := range expectedNames {
+		if q.With[i].Name != name {
+			t.Errorf("CTE[%d].Name = %v, want %v", i, q.With[i].Name, name)
+		}
+	}
+
+	// Verify UNION
+	if len(q.Compound) != 1 {
+		t.Fatalf("Expected 1 compound part, got %d", len(q.Compound))
+	}
+
+	if q.Compound[0].Operator != "UNION" {
+		t.Errorf("Operator = %v, want UNION", q.Compound[0].Operator)
+	}
+}
+
+func TestParseEdgeAliasWithFieldAccess(t *testing.T) {
+	// Edge alias for accessing junction table fields like role
+	input := "SELECT ->member_of AS m->group.name FROM user:alice"
+
+	q, err := Parse(input)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	if q.Select.Path == nil {
+		t.Fatal("Path is nil")
+	}
+
+	// First traversal should have alias
+	if q.Select.Path.Traversals[0].Alias != "m" {
+		t.Errorf("Traversals[0].Alias = %v, want m", q.Select.Path.Traversals[0].Alias)
+	}
+
+	// Second traversal should have field access
+	if q.Select.Path.Traversals[1].Field != "name" {
+		t.Errorf("Traversals[1].Field = %v, want name", q.Select.Path.Traversals[1].Field)
+	}
+}
+
+func TestParseRecursiveTraversalExact(t *testing.T) {
+	// Exact depth: {3} means exactly 3 hops
+	input := "SELECT ->child_of{3}->group FROM group:engineering"
+
+	q, err := Parse(input)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	if q.Select.Path == nil {
+		t.Fatal("Path is nil")
+	}
+
+	if len(q.Select.Path.Traversals) != 2 {
+		t.Fatalf("Expected 2 traversals, got %d", len(q.Select.Path.Traversals))
+	}
+
+	relTrav := q.Select.Path.Traversals[0]
+	if relTrav.Target != "child_of" {
+		t.Errorf("Target = %v, want child_of", relTrav.Target)
+	}
+
+	if !relTrav.HasQuantifier() {
+		t.Error("Expected HasQuantifier() to return true")
+	}
+
+	if relTrav.GetMinHops() != 3 {
+		t.Errorf("GetMinHops() = %d, want 3", relTrav.GetMinHops())
+	}
+
+	if relTrav.GetMaxHops() != 3 {
+		t.Errorf("GetMaxHops() = %d, want 3", relTrav.GetMaxHops())
+	}
+}
+
+func TestParseRecursiveTraversalRange(t *testing.T) {
+	// Range: {1,6} means 1 to 6 hops
+	input := "SELECT ->child_of{1,6}->group FROM group:engineering"
+
+	q, err := Parse(input)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	if q.Select.Path == nil {
+		t.Fatal("Path is nil")
+	}
+
+	relTrav := q.Select.Path.Traversals[0]
+	if relTrav.GetMinHops() != 1 {
+		t.Errorf("GetMinHops() = %d, want 1", relTrav.GetMinHops())
+	}
+
+	if relTrav.GetMaxHops() != 6 {
+		t.Errorf("GetMaxHops() = %d, want 6", relTrav.GetMaxHops())
+	}
+}
+
+func TestParseRecursiveTraversalMixedPath(t *testing.T) {
+	// Mixed path: non-recursive then recursive
+	// "Find all ancestor groups of groups that user alice is a member of"
+	input := "SELECT ->member_of->group->child_of{1,10}->group FROM user:alice"
+
+	q, err := Parse(input)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	if q.Select.Path == nil {
+		t.Fatal("Path is nil")
+	}
+
+	// Should have 4 traversals: member_of, group, child_of{1,10}, group
+	if len(q.Select.Path.Traversals) != 4 {
+		t.Fatalf("Expected 4 traversals, got %d", len(q.Select.Path.Traversals))
+	}
+
+	// First two are non-recursive
+	if q.Select.Path.Traversals[0].Target != "member_of" {
+		t.Errorf("Traversals[0].Target = %v, want member_of", q.Select.Path.Traversals[0].Target)
+	}
+	if q.Select.Path.Traversals[0].HasQuantifier() {
+		t.Error("Traversals[0] should not have quantifier")
+	}
+
+	// Third is recursive
+	if q.Select.Path.Traversals[2].Target != "child_of" {
+		t.Errorf("Traversals[2].Target = %v, want child_of", q.Select.Path.Traversals[2].Target)
+	}
+	if !q.Select.Path.Traversals[2].HasQuantifier() {
+		t.Error("Traversals[2] should have quantifier")
+	}
+	if q.Select.Path.Traversals[2].GetMinHops() != 1 {
+		t.Errorf("Traversals[2].GetMinHops() = %d, want 1", q.Select.Path.Traversals[2].GetMinHops())
+	}
+	if q.Select.Path.Traversals[2].GetMaxHops() != 10 {
+		t.Errorf("Traversals[2].GetMaxHops() = %d, want 10", q.Select.Path.Traversals[2].GetMaxHops())
+	}
+}
+
+// Test wildcard traversal parsing
+func TestParseWildcardTraversal(t *testing.T) {
+	input := "SELECT ->*->group FROM user:alice"
+	q, err := Parse(input)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+
+	if q.Select.Path == nil {
+		t.Fatal("Expected path in SELECT")
+	}
+
+	// Should have 2 traversals: * (wildcard), group
+	if len(q.Select.Path.Traversals) != 2 {
+		t.Fatalf("Expected 2 traversals, got %d", len(q.Select.Path.Traversals))
+	}
+
+	// First traversal should be wildcard
+	if !q.Select.Path.Traversals[0].IsWildcard() {
+		t.Error("Traversals[0] should be wildcard")
+	}
+
+	// Second traversal is the target entity
+	if q.Select.Path.Traversals[1].Target != "group" {
+		t.Errorf("Traversals[1].Target = %v, want group", q.Select.Path.Traversals[1].Target)
+	}
+}
+
+func TestParseWildcardTraversalWithQuantifier(t *testing.T) {
+	input := "SELECT ->*{1,5}->user FROM user:alice"
+	q, err := Parse(input)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+
+	if q.Select.Path == nil {
+		t.Fatal("Expected path in SELECT")
+	}
+
+	// Should have 2 traversals: *{1,5} (wildcard with quantifier), user
+	if len(q.Select.Path.Traversals) != 2 {
+		t.Fatalf("Expected 2 traversals, got %d", len(q.Select.Path.Traversals))
+	}
+
+	// First traversal should be wildcard with quantifier
+	if !q.Select.Path.Traversals[0].IsWildcard() {
+		t.Error("Traversals[0] should be wildcard")
+	}
+	if !q.Select.Path.Traversals[0].HasQuantifier() {
+		t.Error("Traversals[0] should have quantifier")
+	}
+	if q.Select.Path.Traversals[0].GetMinHops() != 1 {
+		t.Errorf("Traversals[0].GetMinHops() = %d, want 1", q.Select.Path.Traversals[0].GetMinHops())
+	}
+	if q.Select.Path.Traversals[0].GetMaxHops() != 5 {
+		t.Errorf("Traversals[0].GetMaxHops() = %d, want 5", q.Select.Path.Traversals[0].GetMaxHops())
+	}
+
+	// Second traversal is the target entity
+	if q.Select.Path.Traversals[1].Target != "user" {
+		t.Errorf("Traversals[1].Target = %v, want user", q.Select.Path.Traversals[1].Target)
+	}
+}
+
+func TestParseDoubleWildcardTraversal(t *testing.T) {
+	input := "SELECT ->*->* FROM user:alice"
+	q, err := Parse(input)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+
+	if q.Select.Path == nil {
+		t.Fatal("Expected path in SELECT")
+	}
+
+	// Should have 2 traversals: both wildcards
+	if len(q.Select.Path.Traversals) != 2 {
+		t.Fatalf("Expected 2 traversals, got %d", len(q.Select.Path.Traversals))
+	}
+
+	// First traversal should be wildcard (relationship)
+	if !q.Select.Path.Traversals[0].IsWildcard() {
+		t.Error("Traversals[0] should be wildcard")
+	}
+
+	// Second traversal should also be wildcard (target entity)
+	if !q.Select.Path.Traversals[1].IsWildcard() {
+		t.Error("Traversals[1] should be wildcard")
+	}
+}
+
+func TestParseIncomingWildcardTraversal(t *testing.T) {
+	input := "SELECT <-*<-user FROM group:admins"
+	q, err := Parse(input)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+
+	if q.Select.Path == nil {
+		t.Fatal("Expected path in SELECT")
+	}
+
+	// Should have 2 traversals
+	if len(q.Select.Path.Traversals) != 2 {
+		t.Fatalf("Expected 2 traversals, got %d", len(q.Select.Path.Traversals))
+	}
+
+	// First traversal should be incoming wildcard
+	if !q.Select.Path.Traversals[0].IsWildcard() {
+		t.Error("Traversals[0] should be wildcard")
+	}
+	if q.Select.Path.Traversals[0].BaseDirection() != "<-" {
+		t.Errorf("Traversals[0].BaseDirection() = %v, want <-", q.Select.Path.Traversals[0].BaseDirection())
+	}
+
+	// Second traversal is the source entity
+	if q.Select.Path.Traversals[1].Target != "user" {
+		t.Errorf("Traversals[1].Target = %v, want user", q.Select.Path.Traversals[1].Target)
+	}
+}
+
+// Test cross-path JOIN parsing
+func TestParseCrossPathJoin(t *testing.T) {
+	input := `SELECT u.email, g.name FROM user AS u ->member_of->group AS g JOIN app:slack ->governed_by->policy AS p ON g.id = p.id`
+	q, err := Parse(input)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+
+	// Check FROM clause
+	if q.From.Entity != "user" {
+		t.Errorf("From.Entity = %v, want user", q.From.Entity)
+	}
+	if q.From.Alias != "u" {
+		t.Errorf("From.Alias = %v, want u", q.From.Alias)
+	}
+
+	// Check FROM path traversals
+	if len(q.From.Path) != 2 {
+		t.Fatalf("Expected 2 traversals in FROM, got %d", len(q.From.Path))
+	}
+	if q.From.Path[0].Target != "member_of" {
+		t.Errorf("From.Path[0].Target = %v, want member_of", q.From.Path[0].Target)
+	}
+	if q.From.Path[1].Target != "group" {
+		t.Errorf("From.Path[1].Target = %v, want group", q.From.Path[1].Target)
+	}
+	if q.From.Path[1].Alias != "g" {
+		t.Errorf("From.Path[1].Alias = %v, want g", q.From.Path[1].Alias)
+	}
+
+	// Check JOIN clause
+	if len(q.Joins) != 1 {
+		t.Fatalf("Expected 1 JOIN, got %d", len(q.Joins))
+	}
+
+	join := q.Joins[0]
+	if join.Entity != "app" {
+		t.Errorf("Join.Entity = %v, want app", join.Entity)
+	}
+	if join.ID != "slack" {
+		t.Errorf("Join.ID = %v, want slack", join.ID)
+	}
+
+	// Check JOIN path
+	if len(join.Path) != 2 {
+		t.Fatalf("Expected 2 traversals in JOIN, got %d", len(join.Path))
+	}
+	if join.Path[0].Target != "governed_by" {
+		t.Errorf("Join.Path[0].Target = %v, want governed_by", join.Path[0].Target)
+	}
+	if join.Path[1].Target != "policy" {
+		t.Errorf("Join.Path[1].Target = %v, want policy", join.Path[1].Target)
+	}
+	if join.Path[1].Alias != "p" {
+		t.Errorf("Join.Path[1].Alias = %v, want p", join.Path[1].Alias)
+	}
+
+	// Check ON condition
+	if join.On == nil {
+		t.Fatal("Expected ON condition")
+	}
+	if join.On.Left.Alias != "g" {
+		t.Errorf("On.Left.Alias = %v, want g", join.On.Left.Alias)
+	}
+	if join.On.Left.Field != "id" {
+		t.Errorf("On.Left.Field = %v, want id", join.On.Left.Field)
+	}
+	if join.On.Op != "=" {
+		t.Errorf("On.Op = %v, want =", join.On.Op)
+	}
+	if join.On.Right.Alias != "p" {
+		t.Errorf("On.Right.Alias = %v, want p", join.On.Right.Alias)
+	}
+	if join.On.Right.Field != "id" {
+		t.Errorf("On.Right.Field = %v, want id", join.On.Right.Field)
+	}
+}
+
+func TestParseCrossPathJoinMultiple(t *testing.T) {
+	input := `SELECT * FROM user AS u
+		->member_of->group AS g
+		->has_access->app AS a
+		JOIN app:slack ->governed_by->policy AS p ->has_rule->rule AS r ON a.id = r.app_id
+		JOIN rule AS r2 ->applies_to->group AS rg ON g.id = rg.id`
+
+	q, err := Parse(input)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+
+	// Should have 2 JOINs
+	if len(q.Joins) != 2 {
+		t.Fatalf("Expected 2 JOINs, got %d", len(q.Joins))
+	}
+
+	// First JOIN starts from app:slack
+	if q.Joins[0].Entity != "app" {
+		t.Errorf("Joins[0].Entity = %v, want app", q.Joins[0].Entity)
+	}
+	if q.Joins[0].ID != "slack" {
+		t.Errorf("Joins[0].ID = %v, want slack", q.Joins[0].ID)
+	}
+
+	// Second JOIN starts from rule
+	if q.Joins[1].Entity != "rule" {
+		t.Errorf("Joins[1].Entity = %v, want rule", q.Joins[1].Entity)
+	}
+	if q.Joins[1].Alias != "r2" {
+		t.Errorf("Joins[1].Alias = %v, want r2", q.Joins[1].Alias)
+	}
+}
+
+func TestParseLeftJoin(t *testing.T) {
+	input := `SELECT * FROM user AS u LEFT JOIN group AS g ->has_access->app ON u.id = g.user_id`
+	q, err := Parse(input)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+
+	if len(q.Joins) != 1 {
+		t.Fatalf("Expected 1 JOIN, got %d", len(q.Joins))
+	}
+
+	// Check it's a LEFT JOIN
+	if q.Joins[0].Type != "LEFTJOIN" && q.Joins[0].Type != "LEFT JOIN" {
+		t.Errorf("Join.Type = %v, want LEFT JOIN", q.Joins[0].Type)
+	}
+}
+
+// Test EXPLAIN ACCESS parsing
+func TestParseExplainAccess(t *testing.T) {
+	input := "EXPLAIN ACCESS user:alice TO app:slack"
+	stmt, err := ParseStatement(input)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+
+	if stmt.ExplainAccess == nil {
+		t.Fatal("Expected ExplainAccess statement")
+	}
+
+	ea := stmt.ExplainAccess
+	if ea.FromEntity != "user" {
+		t.Errorf("FromEntity = %v, want user", ea.FromEntity)
+	}
+	if ea.FromID != "alice" {
+		t.Errorf("FromID = %v, want alice", ea.FromID)
+	}
+	if ea.ToEntity != "app" {
+		t.Errorf("ToEntity = %v, want app", ea.ToEntity)
+	}
+	if ea.ToID != "slack" {
+		t.Errorf("ToID = %v, want slack", ea.ToID)
+	}
+}
+
+func TestParseExplainAccessQuotedIDs(t *testing.T) {
+	input := `EXPLAIN ACCESS user:'okta_user_001' TO app:'app-12345'`
+	stmt, err := ParseStatement(input)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+
+	if stmt.ExplainAccess == nil {
+		t.Fatal("Expected ExplainAccess statement")
+	}
+
+	ea := stmt.ExplainAccess
+	if ea.FromID != "okta_user_001" {
+		t.Errorf("FromID = %v, want okta_user_001", ea.FromID)
+	}
+	if ea.ToID != "app-12345" {
+		t.Errorf("ToID = %v, want app-12345", ea.ToID)
+	}
+}

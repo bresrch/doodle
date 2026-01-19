@@ -5,7 +5,9 @@ type Query struct {
 	With     []*CTEDef       `parser:"('WITH' @@ (',' @@)*)?"`
 	Select   *SelectClause   `parser:"'SELECT' @@"`
 	From     *FromClause     `parser:"'FROM' @@"`
+	Joins    []*JoinClause   `parser:"@@*"`
 	Version  *VersionClause  `parser:"('VERSION' @@)?"`
+	Versions *VersionsClause `parser:"('VERSIONS' @@)?"`
 	Where    *WhereClause    `parser:"('WHERE' @@)?"`
 	GroupBy  *GroupByClause  `parser:"('GROUP' 'BY' @@)?"`
 	Having   *HavingClause   `parser:"('HAVING' @@)?"`
@@ -31,6 +33,25 @@ type CompoundPart struct {
 type VersionClause struct {
 	Timestamp *string `parser:"( @DateTime"`
 	Number    *int    `parser:"| @Int )"`
+}
+
+// VersionsClause represents multi-version queries (VERSIONS ALL, VERSIONS LAST N, etc.)
+type VersionsClause struct {
+	All     bool `parser:"( @'ALL'"`
+	Last    *int `parser:"| 'LAST' @Int"`
+	Between *VersionRange `parser:"| @@ )"`
+}
+
+// VersionRange represents a version range (BETWEEN x AND y)
+type VersionRange struct {
+	From *string `parser:"'BETWEEN' @DateTime 'AND'"`
+	To   *string `parser:"@DateTime"`
+}
+
+// MetaFunction represents meta:: namespace functions for version navigation
+type MetaFunction struct {
+	Name string `parser:"'meta' ':' ':' @('version' | 'version_num' | 'operation' | 'valid_from' | 'valid_to' | 'previous' | 'first' | 'latest')"`
+	Call bool   `parser:"@( '(' ')' )?"`
 }
 
 // SelectClause represents the SELECT portion of a query
@@ -60,21 +81,33 @@ type Path struct {
 
 // Traversal represents a single edge traversal
 type Traversal struct {
-	Direction string `parser:"@('->' | '<-' | '->?' | '<?-' | '->!' | '<!-')"`
-	Target    string `parser:"@(Ident | 'GROUP' | 'ORDER' | 'VERSION' | 'LIMIT' | 'OFFSET' | 'COUNT' | 'SUM' | 'AVG' | 'MIN' | 'MAX' | 'AS')"`
+	Direction string `parser:"@('->' | '<-' | '<->' | '?->' | '?<-' | '!->' | '!<-' | '->?' | '<?-' | '->!' | '<!-')"`
+	Wildcard  bool   `parser:"( @'*'"`
+	Target    string `parser:"| @(Ident | 'GROUP' | 'ORDER' | 'VERSION' | 'LIMIT' | 'OFFSET' | 'COUNT' | 'SUM' | 'AVG' | 'MIN' | 'MAX' | 'AS') )"`
 	MinHops   *int   `parser:"('{' @Int"`
 	MaxHops   *int   `parser:"(',' @Int)? '}')?"`
+	Alias     string `parser:"('AS' @Ident)?"`
 	Field     string `parser:"('.' @(Ident | 'GROUP' | 'ORDER' | 'VERSION' | 'LIMIT' | 'OFFSET' | 'COUNT' | 'SUM' | 'AVG' | 'MIN' | 'MAX' | 'AS'))?"`
 }
 
 // IsOptional returns true if this traversal uses LEFT JOIN semantics
 func (t *Traversal) IsOptional() bool {
-	return t.Direction == "->?" || t.Direction == "<?-"
+	return t.Direction == "->?" || t.Direction == "<?-" || t.Direction == "?->" || t.Direction == "?<-"
+}
+
+// IsWildcard returns true if this traversal matches any relationship
+func (t *Traversal) IsWildcard() bool {
+	return t.Wildcard
 }
 
 // IsNegated returns true if this traversal uses NOT EXISTS semantics
 func (t *Traversal) IsNegated() bool {
-	return t.Direction == "->!" || t.Direction == "<!-"
+	return t.Direction == "->!" || t.Direction == "<!-" || t.Direction == "!->" || t.Direction == "!<-"
+}
+
+// IsBidirectional returns true if this traversal matches in either direction
+func (t *Traversal) IsBidirectional() bool {
+	return t.Direction == "<->"
 }
 
 // HasQuantifier returns true if this traversal has path length constraints
@@ -90,7 +123,9 @@ func (t *Traversal) GetMinHops() int {
 	return 1
 }
 
-// GetMaxHops returns the maximum hops (default same as min)
+// GetMaxHops returns the maximum hops
+// Returns the explicit max if set, otherwise returns min (for exact count like {3})
+// For unbounded recursion, the generator will handle setting a safe maximum
 func (t *Traversal) GetMaxHops() int {
 	if t.MaxHops != nil {
 		return *t.MaxHops
@@ -101,13 +136,21 @@ func (t *Traversal) GetMaxHops() int {
 	return 1
 }
 
+// IsUnbounded returns true if this traversal has unbounded recursion (e.g., {1,})
+// This is indicated by MinHops being set but MaxHops being nil
+func (t *Traversal) IsUnbounded() bool {
+	return t.MinHops != nil && t.MaxHops == nil
+}
+
 // BaseDirection returns the base direction without optional/negated marker
 func (t *Traversal) BaseDirection() string {
 	switch t.Direction {
-	case "->?", "->!":
+	case "->?", "->!", "?->", "!->":
 		return "->"
-	case "<?-", "<!-":
+	case "<?-", "<!-", "?<-", "!<-":
 		return "<-"
+	case "<->":
+		return "<->"
 	default:
 		return t.Direction
 	}
@@ -201,10 +244,34 @@ type Field struct {
 
 // FromClause represents the FROM portion
 type FromClause struct {
-	Subquery *Query `parser:"( '(' @@ ')'"`
-	Entity   string `parser:"| @(Ident | 'GROUP' | 'ORDER' | 'VERSION' | 'LIMIT' | 'OFFSET' | 'COUNT' | 'SUM' | 'AVG' | 'MIN' | 'MAX' | 'AS') )"`
-	ID       string `parser:"( ':' @(Ident | String | 'GROUP' | 'ORDER' | 'VERSION' | 'LIMIT' | 'OFFSET' | 'COUNT' | 'SUM' | 'AVG' | 'MIN' | 'MAX' | 'AS') )?"`
-	Alias    string `parser:"('AS' @(Ident | 'GROUP' | 'ORDER' | 'VERSION' | 'LIMIT' | 'OFFSET' | 'COUNT' | 'SUM' | 'AVG' | 'MIN' | 'MAX'))?"`
+	Subquery *Query       `parser:"( '(' @@ ')'"`
+	Entity   string       `parser:"| @(Ident | 'GROUP' | 'ORDER' | 'VERSION' | 'LIMIT' | 'OFFSET' | 'COUNT' | 'SUM' | 'AVG' | 'MIN' | 'MAX' | 'AS') )"`
+	ID       string       `parser:"( ':' @(Ident | String | 'GROUP' | 'ORDER' | 'VERSION' | 'LIMIT' | 'OFFSET' | 'COUNT' | 'SUM' | 'AVG' | 'MIN' | 'MAX' | 'AS') )?"`
+	Alias    string       `parser:"('AS' @(Ident | 'GROUP' | 'ORDER' | 'VERSION' | 'LIMIT' | 'OFFSET' | 'COUNT' | 'SUM' | 'AVG' | 'MIN' | 'MAX'))?"`
+	Path     []*Traversal `parser:"@@*"`
+}
+
+// JoinClause represents a JOIN with another path traversal
+type JoinClause struct {
+	Type   string         `parser:"@('LEFT' 'JOIN' | 'JOIN')"`
+	Entity string         `parser:"@(Ident | 'GROUP' | 'ORDER' | 'VERSION' | 'LIMIT' | 'OFFSET' | 'COUNT' | 'SUM' | 'AVG' | 'MIN' | 'MAX' | 'AS')"`
+	ID     string         `parser:"( ':' @(Ident | String | 'GROUP' | 'ORDER' | 'VERSION' | 'LIMIT' | 'OFFSET' | 'COUNT' | 'SUM' | 'AVG' | 'MIN' | 'MAX' | 'AS') )?"`
+	Alias  string         `parser:"('AS' @(Ident | 'GROUP' | 'ORDER' | 'VERSION' | 'LIMIT' | 'OFFSET' | 'COUNT' | 'SUM' | 'AVG' | 'MIN' | 'MAX'))?"`
+	Path   []*Traversal   `parser:"@@*"`
+	On     *JoinCondition `parser:"'ON' @@"`
+}
+
+// JoinCondition represents the ON condition for a JOIN
+type JoinCondition struct {
+	Left  *JoinField `parser:"@@"`
+	Op    string     `parser:"@('=' | '!=' | '>' | '<' | '>=' | '<=')"`
+	Right *JoinField `parser:"@@"`
+}
+
+// JoinField represents a field reference in a JOIN condition (alias.field)
+type JoinField struct {
+	Alias string `parser:"@Ident"`
+	Field string `parser:"'.' @Ident"`
 }
 
 // WhereClause represents filtering conditions with OR support
@@ -292,12 +359,13 @@ type OrderByField struct {
 	Direction string `parser:"@('ASC' | 'DESC')?"`
 }
 
-// Statement represents any doodle statement (SELECT, INSERT, UPDATE, DELETE)
+// Statement represents any doodle statement (SELECT, INSERT, UPDATE, DELETE, EXPLAIN ACCESS)
 type Statement struct {
-	Insert *InsertStmt `parser:"  @@"`
-	Update *UpdateStmt `parser:"| @@"`
-	Delete *DeleteStmt `parser:"| @@"`
-	Select *Query      `parser:"| @@"`
+	ExplainAccess *ExplainAccessStmt `parser:"  @@"`
+	Insert        *InsertStmt        `parser:"| @@"`
+	Update        *UpdateStmt        `parser:"| @@"`
+	Delete        *DeleteStmt        `parser:"| @@"`
+	Select        *Query             `parser:"| @@"`
 }
 
 // InsertStmt represents an INSERT statement
@@ -355,4 +423,15 @@ type DeleteStmt struct {
 type ReturningClause struct {
 	Star   bool     `parser:"( @'*'"`
 	Fields []*Field `parser:"| @@ (',' @@)* )"`
+}
+
+// ExplainAccessStmt represents an EXPLAIN ACCESS statement
+// Syntax: EXPLAIN ACCESS user:alice TO app:slack [VERSION d'2024-01-01' | VERSIONS ALL | VERSIONS LAST N | VERSIONS BETWEEN x AND y]
+type ExplainAccessStmt struct {
+	FromEntity string          `parser:"'EXPLAIN' 'ACCESS' @Ident"`
+	FromID     string          `parser:"':' @(Ident | String)"`
+	ToEntity   string          `parser:"'TO' @Ident"`
+	ToID       string          `parser:"':' @(Ident | String)"`
+	Version    *VersionClause  `parser:"('VERSION' @@)?"`
+	Versions   *VersionsClause `parser:"('VERSIONS' @@)?"`
 }

@@ -199,6 +199,53 @@ func (s *Schema) GetEntity(name string) (*Entity, error) {
 	return e, nil
 }
 
+// GetRelationshipByName retrieves a relationship by name only
+func (s *Schema) GetRelationshipByName(name string) (*Relationship, error) {
+	for _, rel := range s.Relationships {
+		if rel.Name == name {
+			return rel, nil
+		}
+	}
+	return nil, fmt.Errorf("relationship %s not found", name)
+}
+
+// FindRelationshipsFrom finds all relationships originating from an entity (outgoing)
+func (s *Schema) FindRelationshipsFrom(entityName string) []*Relationship {
+	var rels []*Relationship
+	for _, rel := range s.Relationships {
+		if rel.FromEntity == entityName {
+			rels = append(rels, rel)
+		}
+	}
+	return rels
+}
+
+// FindRelationshipsTo finds all relationships pointing to an entity (incoming)
+func (s *Schema) FindRelationshipsTo(entityName string) []*Relationship {
+	var rels []*Relationship
+	for _, rel := range s.Relationships {
+		if rel.ToEntity == entityName {
+			rels = append(rels, rel)
+		}
+	}
+	return rels
+}
+
+// FindAllRelationships finds all relationships involving an entity (both directions)
+func (s *Schema) FindAllRelationships(entityName string) []*Relationship {
+	var rels []*Relationship
+	seen := make(map[string]bool)
+	for key, rel := range s.Relationships {
+		if rel.FromEntity == entityName || rel.ToEntity == entityName {
+			if !seen[key] {
+				rels = append(rels, rel)
+				seen[key] = true
+			}
+		}
+	}
+	return rels
+}
+
 // Validate checks schema consistency
 func (s *Schema) Validate() error {
 	for key, rel := range s.Relationships {

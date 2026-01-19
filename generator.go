@@ -83,6 +83,42 @@ func (g *Generator) Generate(q *Query) (*GeneratedQuery, error) {
 	var isAggregate bool
 	var hasGroupBy = q.GroupBy != nil
 
+	// Process traversals in FROM clause (e.g., FROM users:'xxx'->member_of->groups)
+	if len(q.From.Path) > 0 {
+		travResult, err := g.processTraversals(q.From.Path, currentEntity, startAlias, aliases, &joins)
+		if err != nil {
+			return nil, err
+		}
+		// Update current entity and alias to the traversal target
+		lastTrav := q.From.Path[len(q.From.Path)-1]
+		currentEntity = lastTrav.Target
+		finalAlias = travResult.FinalAlias
+	}
+
+	// Register FROM alias if specified (for cross-path join references)
+	if q.From.Alias != "" {
+		aliases.aliases[q.From.Alias] = startAlias
+	}
+
+	// Track ON conditions for JOINs (added to WHERE clause)
+	var joinOnConditions []string
+
+	// Process JOIN clauses for cross-path joins
+	if len(q.Joins) > 0 {
+		for _, joinClause := range q.Joins {
+			joinSQL, onCond, err := g.processJoinClause(joinClause, aliases, &joins, len(result.Params))
+			if err != nil {
+				return nil, err
+			}
+			if len(joinSQL) > 0 {
+				joins = append(joins, joinSQL...)
+			}
+			if onCond != "" {
+				joinOnConditions = append(joinOnConditions, onCond)
+			}
+		}
+	}
+
 	// Handle DISTINCT
 	distinctPrefix := ""
 	if q.Select.Distinct {
@@ -91,6 +127,11 @@ func (g *Generator) Generate(q *Query) (*GeneratedQuery, error) {
 
 	// Process traversals if present in SELECT path
 	if q.Select.Path != nil && len(q.Select.Path.Traversals) > 0 {
+		// Check for wildcard paths - generate UNION of all matching relationships
+		if hasWildcardPath(q.Select.Path.Traversals) {
+			return g.generateWithWildcardPath(q, startEntity, startAlias, cteSQL, result.Params)
+		}
+
 		// Check for variable-length paths - use recursive CTE
 		if hasVariableLengthPath(q.Select.Path.Traversals) {
 			return g.generateWithRecursivePath(q, startEntity, startAlias, cteSQL, result.Params)
@@ -101,25 +142,34 @@ func (g *Generator) Generate(q *Query) (*GeneratedQuery, error) {
 			return nil, err
 		}
 		finalAlias = travResult.FinalAlias
-		// Build SELECT with target entity and any junction fields
-		selectParts := []string{fmt.Sprintf("%s.*", finalAlias)}
+
+		// Check if the last traversal specifies a field (e.g., ->groups.name)
+		lastTrav := q.Select.Path.Traversals[len(q.Select.Path.Traversals)-1]
+		var selectParts []string
+		if lastTrav.Field != "" {
+			// Select specific field from target entity
+			selectParts = []string{fmt.Sprintf("%s.%s", finalAlias, lastTrav.Field)}
+		} else {
+			// Select all fields from target entity
+			selectParts = []string{fmt.Sprintf("%s.*", finalAlias)}
+		}
 		selectParts = append(selectParts, travResult.JunctionFields...)
 		selectClause = distinctPrefix + strings.Join(selectParts, ", ")
 	} else if q.Select.Aggregate != nil {
 		// Handle aggregate function
 		isAggregate = true
-		aggSQL, err := g.generateAggregate(q.Select.Aggregate, startAlias, currentEntity, aliases, &joins)
+		aggSQL, err := g.generateAggregate(q.Select.Aggregate, finalAlias, currentEntity, aliases, &joins)
 		if err != nil {
 			return nil, err
 		}
 		selectClause = distinctPrefix + aggSQL
 	} else if q.Select.Star {
-		selectClause = fmt.Sprintf("%s%s.*", distinctPrefix, startAlias)
+		selectClause = fmt.Sprintf("%s%s.*", distinctPrefix, finalAlias)
 	} else if len(q.Select.Fields) > 0 {
 		// Specific fields
 		fields := make([]string, len(q.Select.Fields))
 		for i, f := range q.Select.Fields {
-			fieldStr, fieldIsAgg, err := g.generateFieldExprWithAggCheck(f, startAlias, currentEntity, aliases, &joins)
+			fieldStr, fieldIsAgg, err := g.generateFieldExprWithAggCheck(f, finalAlias, currentEntity, aliases, &joins)
 			if err != nil {
 				return nil, err
 			}
@@ -130,7 +180,7 @@ func (g *Generator) Generate(q *Query) (*GeneratedQuery, error) {
 		}
 		selectClause = distinctPrefix + strings.Join(fields, ", ")
 	} else {
-		selectClause = fmt.Sprintf("%s%s.*", distinctPrefix, startAlias)
+		selectClause = fmt.Sprintf("%s%s.*", distinctPrefix, finalAlias)
 	}
 
 	// Build base query
@@ -173,6 +223,29 @@ func (g *Generator) Generate(q *Query) (*GeneratedQuery, error) {
 					fmt.Sprintf("%s.%s = $%d", startAlias, tc.VersionColumn, len(result.Params)),
 				)
 			}
+		} else if q.Versions != nil {
+			// Multi-version queries
+			if q.Versions.All {
+				// VERSIONS ALL - no temporal filter, return all versions
+				// (no WHERE clause for valid_to)
+			} else if q.Versions.Last != nil {
+				// VERSIONS LAST N - return last N versions ordered by version number
+				// Add ORDER BY and LIMIT later, no temporal filter needed
+			} else if q.Versions.Between != nil {
+				// VERSIONS BETWEEN - filter by time range
+				if q.Versions.Between.From != nil {
+					result.Params = append(result.Params, *q.Versions.Between.From)
+					whereClauses = append(whereClauses,
+						fmt.Sprintf("%s.%s >= $%d", startAlias, tc.ValidFromColumn, len(result.Params)),
+					)
+				}
+				if q.Versions.Between.To != nil {
+					result.Params = append(result.Params, *q.Versions.Between.To)
+					whereClauses = append(whereClauses,
+						fmt.Sprintf("%s.%s <= $%d", startAlias, tc.ValidFromColumn, len(result.Params)),
+					)
+				}
+			}
 		} else {
 			// Default: current version (valid_to = infinity)
 			whereClauses = append(whereClauses,
@@ -182,14 +255,18 @@ func (g *Generator) Generate(q *Query) (*GeneratedQuery, error) {
 	}
 
 	// User-defined conditions with OR support
+	// Use finalAlias so WHERE applies to the target entity after FROM path traversal
 	if q.Where != nil {
-		whereSQL, params, err := g.generateWhereClause(q.Where, aliases, startAlias, len(result.Params))
+		whereSQL, params, err := g.generateWhereClause(q.Where, aliases, finalAlias, len(result.Params))
 		if err != nil {
 			return nil, err
 		}
 		result.Params = append(result.Params, params...)
 		whereClauses = append(whereClauses, whereSQL)
 	}
+
+	// Add JOIN ON conditions to WHERE clause
+	whereClauses = append(whereClauses, joinOnConditions...)
 
 	if len(whereClauses) > 0 {
 		sql += " WHERE " + strings.Join(whereClauses, " AND ")
@@ -218,11 +295,17 @@ func (g *Generator) Generate(q *Query) (*GeneratedQuery, error) {
 			return nil, err
 		}
 		sql += " ORDER BY " + orderBySQL
+	} else if q.Versions != nil && q.Versions.Last != nil && startEntity.Temporal != nil {
+		// VERSIONS LAST N - order by version number descending
+		sql += fmt.Sprintf(" ORDER BY %s.%s DESC", startAlias, startEntity.Temporal.VersionColumn)
 	}
 
 	// Add LIMIT
 	if q.Limit != nil {
 		sql += fmt.Sprintf(" LIMIT %d", *q.Limit)
+	} else if q.Versions != nil && q.Versions.Last != nil {
+		// VERSIONS LAST N - limit to N versions
+		sql += fmt.Sprintf(" LIMIT %d", *q.Versions.Last)
 	}
 
 	// Add OFFSET
@@ -433,14 +516,50 @@ type TraversalResult struct {
 // hasVariableLengthPath checks if any traversal has a quantifier requiring recursive CTE
 func hasVariableLengthPath(travs []*Traversal) bool {
 	for _, t := range travs {
-		if t.HasQuantifier() && (t.GetMinHops() != 1 || t.GetMaxHops() != 1) {
+		if t.HasQuantifier() {
+			// Check if this is a multi-hop traversal
+			minHops := t.GetMinHops()
+			maxHops := t.GetMaxHops()
+			// Variable length if max > 1 OR max is unbounded (indicated by max == min when min > 1)
+			if maxHops > 1 || (minHops > 1 && maxHops == minHops) {
+				return true
+			}
+			// Also check for unbounded (when MaxHops is nil but MinHops is set)
+			if t.MinHops != nil && t.MaxHops == nil && *t.MinHops >= 1 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// hasWildcardPath checks if any traversal is a wildcard
+func hasWildcardPath(travs []*Traversal) bool {
+	for _, t := range travs {
+		if t.IsWildcard() {
 			return true
 		}
 	}
 	return false
 }
 
+// findRecursiveTraversalIndex finds the index of the first recursive traversal in the path
+// Returns -1 if no recursive traversal is found
+func findRecursiveTraversalIndex(travs []*Traversal) int {
+	for i := 0; i < len(travs); i += 2 {
+		if travs[i].HasQuantifier() {
+			minHops := travs[i].GetMinHops()
+			maxHops := travs[i].GetMaxHops()
+			if maxHops > 1 || (minHops >= 1 && travs[i].MaxHops == nil) {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
 // generateWithRecursivePath generates a recursive CTE for variable-length paths
+// Handles mixed paths like: ->member_of->group->child_of{1,6}->group
 func (g *Generator) generateWithRecursivePath(q *Query, startEntity *Entity, startAlias, cteSQL string, cteParams []interface{}) (*GeneratedQuery, error) {
 	result := &GeneratedQuery{
 		Params: cteParams,
@@ -451,36 +570,64 @@ func (g *Generator) generateWithRecursivePath(q *Query, startEntity *Entity, sta
 		return nil, fmt.Errorf("variable-length path requires at least relationship and target entity")
 	}
 
-	// Find the traversal with the quantifier
-	var relTrav, entTrav *Traversal
-	var minHops, maxHops int
-
-	for i := 0; i < len(travs); i += 2 {
-		if i+1 >= len(travs) {
-			return nil, fmt.Errorf("incomplete path: relationship without target entity")
-		}
-		if travs[i].HasQuantifier() {
-			relTrav = travs[i]
-			entTrav = travs[i+1]
-			minHops = relTrav.GetMinHops()
-			maxHops = relTrav.GetMaxHops()
-			break
-		}
+	// Find where the recursive traversal starts
+	recursiveIdx := findRecursiveTraversalIndex(travs)
+	if recursiveIdx == -1 {
+		return nil, fmt.Errorf("no recursive traversal found in path")
 	}
 
-	if relTrav == nil {
-		return nil, fmt.Errorf("no quantifier found in path")
+	// Split path into prefix (non-recursive) and recursive parts
+	prefixTravs := travs[:recursiveIdx]
+	recursiveRelTrav := travs[recursiveIdx]
+	recursiveEntTrav := travs[recursiveIdx+1]
+
+	minHops := recursiveRelTrav.GetMinHops()
+	maxHops := recursiveRelTrav.GetMaxHops()
+	// GetMaxHops returns MinHops for exact depth like {3}, which is correct
+	// For truly unbounded recursion (future: {1,} syntax), we'd need to detect it differently
+
+	// Determine the entity we're starting the recursion from
+	var recursionStartEntity *Entity
+
+	// Track aliases for the prefix path
+	aliases := &aliasTracker{
+		aliases: make(map[string]string),
+		counter: 0,
+	}
+	prefixStartAlias := aliases.next(startEntity.Name)
+
+	var sql strings.Builder
+
+	// Add any existing CTEs
+	if cteSQL != "" {
+		sql.WriteString(cteSQL[:len(cteSQL)-1]) // Remove trailing space
+		sql.WriteString(", ")
+	} else {
+		sql.WriteString("WITH ")
 	}
 
-	// Find the relationship
-	baseDirection := relTrav.BaseDirection()
-	rel, err := g.schema.FindRelationship(startEntity.Name, relTrav.Target, baseDirection)
+	// If there's a prefix path, we need to process it first
+	if len(prefixTravs) > 0 {
+		// The entity before the recursive part
+		lastPrefixEntTrav := prefixTravs[len(prefixTravs)-1]
+		var err error
+		recursionStartEntity, err = g.schema.GetEntity(lastPrefixEntTrav.Target)
+		if err != nil {
+			return nil, fmt.Errorf("unknown entity %s: %w", lastPrefixEntTrav.Target, err)
+		}
+	} else {
+		recursionStartEntity = startEntity
+	}
+
+	// Find the recursive relationship
+	baseDirection := recursiveRelTrav.BaseDirection()
+	rel, err := g.schema.FindRelationship(recursionStartEntity.Name, recursiveRelTrav.Target, baseDirection)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("relationship %s not found from %s: %w", recursiveRelTrav.Target, recursionStartEntity.Name, err)
 	}
 
-	// Get target entity
-	targetEntity, err := g.schema.GetEntity(entTrav.Target)
+	// Get target entity (should be same as recursion start for self-referential)
+	targetEntity, err := g.schema.GetEntity(recursiveEntTrav.Target)
 	if err != nil {
 		return nil, err
 	}
@@ -495,56 +642,140 @@ func (g *Generator) generateWithRecursivePath(q *Query, startEntity *Entity, sta
 		targetKey = rel.FromKey
 	}
 
-	// Build the recursive CTE
-	// WITH RECURSIVE path_cte AS (
-	//   -- Base case
-	//   SELECT j.target_id AS id, 1 AS depth FROM junction j
-	//   JOIN source s ON j.source_id = s.id WHERE s.external_id = $1
-	//   UNION ALL
-	//   -- Recursive case
-	//   SELECT j.target_id AS id, p.depth + 1 FROM path_cte p
-	//   JOIN junction j ON p.id = j.source_id WHERE p.depth < maxHops
-	// )
-	// SELECT DISTINCT t.* FROM path_cte p JOIN target t ON p.id = t.id
-	// WHERE p.depth >= minHops AND t.valid_to = 'infinity'
-
-	var sql strings.Builder
-
-	// Add any existing CTEs
-	if cteSQL != "" {
-		sql.WriteString(cteSQL[:len(cteSQL)-1]) // Remove trailing space
-		sql.WriteString(", ")
-	} else {
-		sql.WriteString("WITH ")
-	}
-
 	sql.WriteString("RECURSIVE path_cte AS (")
 
-	// Base case: first hop from start entity
-	sql.WriteString(fmt.Sprintf("SELECT j0.%s AS id, 1 AS depth FROM %s j0 ", targetKey, rel.JoinTable))
-	sql.WriteString(fmt.Sprintf("JOIN %s %s ON j0.%s = %s.%s ", startEntity.Table, startAlias, sourceKey, startAlias, startEntity.PrimaryKey))
+	// === BASE CASE ===
+	if len(prefixTravs) > 0 {
+		// Base case with prefix path: join through prefix tables to get starting points
+		// SELECT gh.parent_group_id AS id, 1 AS depth
+		// FROM users u
+		// JOIN user_groups ug ON u.id = ug.user_id
+		// JOIN groups g ON ug.group_id = g.id
+		// JOIN group_hierarchy gh ON g.id = gh.child_group_id
+		// WHERE u.external_id = $1 AND ...temporal filters...
 
-	// Add temporal filter for start entity
-	if startEntity.Temporal != nil {
-		sql.WriteString(fmt.Sprintf("WHERE %s.valid_to = 'infinity' ", startAlias))
+		sql.WriteString(fmt.Sprintf("SELECT j_rec.%s AS id, 1 AS depth FROM %s %s ",
+			targetKey, startEntity.Table, prefixStartAlias))
+
+		// Process prefix traversals to build joins
+		currentEntity := startEntity.Name
+		currentAlias := prefixStartAlias
+		joinCounter := 0
+
+		for i := 0; i < len(prefixTravs); i += 2 {
+			if i+1 >= len(prefixTravs) {
+				return nil, fmt.Errorf("incomplete prefix path")
+			}
+
+			prefixRelTrav := prefixTravs[i]
+			prefixEntTrav := prefixTravs[i+1]
+
+			prefixDir := prefixRelTrav.BaseDirection()
+			prefixRel, err := g.schema.FindRelationship(currentEntity, prefixRelTrav.Target, prefixDir)
+			if err != nil {
+				return nil, err
+			}
+
+			currentEntityDef, _ := g.schema.GetEntity(currentEntity)
+
+			var prefixSourceKey, prefixTargetKey string
+			if prefixDir == "->" {
+				prefixSourceKey = prefixRel.FromKey
+				prefixTargetKey = prefixRel.ToKey
+			} else {
+				prefixSourceKey = prefixRel.ToKey
+				prefixTargetKey = prefixRel.FromKey
+			}
+
+			// Junction table join
+			jAlias := fmt.Sprintf("j%d", joinCounter)
+			joinCounter++
+			sql.WriteString(fmt.Sprintf("JOIN %s %s ON %s.%s = %s.%s ",
+				prefixRel.JoinTable, jAlias,
+				currentAlias, currentEntityDef.PrimaryKey,
+				jAlias, prefixSourceKey))
+
+			// Add temporal filter for junction
+			if prefixRel.Temporal != nil {
+				sql.WriteString(fmt.Sprintf("AND %s.%s = 'infinity' ", jAlias, prefixRel.Temporal.ValidToColumn))
+			}
+
+			// Target entity join
+			targetEntDef, err := g.schema.GetEntity(prefixEntTrav.Target)
+			if err != nil {
+				return nil, err
+			}
+			tAlias := fmt.Sprintf("t%d", joinCounter)
+			sql.WriteString(fmt.Sprintf("JOIN %s %s ON %s.%s = %s.%s ",
+				targetEntDef.Table, tAlias,
+				jAlias, prefixTargetKey,
+				tAlias, targetEntDef.PrimaryKey))
+
+			// Add temporal filter for entity
+			if targetEntDef.Temporal != nil {
+				sql.WriteString(fmt.Sprintf("AND %s.%s = 'infinity' ", tAlias, targetEntDef.Temporal.ValidToColumn))
+			}
+
+			currentEntity = prefixEntTrav.Target
+			currentAlias = tAlias
+		}
+
+		// Now add the recursive relationship junction table
+		sql.WriteString(fmt.Sprintf("JOIN %s j_rec ON %s.%s = j_rec.%s ",
+			rel.JoinTable, currentAlias, recursionStartEntity.PrimaryKey, sourceKey))
+
+		if rel.Temporal != nil {
+			sql.WriteString(fmt.Sprintf("AND j_rec.%s = 'infinity' ", rel.Temporal.ValidToColumn))
+		}
+
+		// WHERE clause
+		sql.WriteString("WHERE ")
+		whereParts := []string{}
+
+		// Add ID filter if present
+		if q.From.ID != "" {
+			result.Params = append(result.Params, cleanID(q.From.ID))
+			whereParts = append(whereParts, fmt.Sprintf("%s.external_id = $%d", prefixStartAlias, len(result.Params)))
+		}
+
+		// Add temporal filter for start entity
+		if startEntity.Temporal != nil {
+			whereParts = append(whereParts, fmt.Sprintf("%s.%s = 'infinity'", prefixStartAlias, startEntity.Temporal.ValidToColumn))
+		}
+
+		if len(whereParts) > 0 {
+			sql.WriteString(strings.Join(whereParts, " AND "))
+		} else {
+			sql.WriteString("1=1")
+		}
+
 	} else {
-		sql.WriteString("WHERE 1=1 ")
+		// Simple base case: direct recursion from start entity
+		sql.WriteString(fmt.Sprintf("SELECT j0.%s AS id, 1 AS depth FROM %s j0 ", targetKey, rel.JoinTable))
+		sql.WriteString(fmt.Sprintf("JOIN %s %s ON j0.%s = %s.%s ", startEntity.Table, prefixStartAlias, sourceKey, prefixStartAlias, startEntity.PrimaryKey))
+
+		// Add temporal filter for start entity
+		if startEntity.Temporal != nil {
+			sql.WriteString(fmt.Sprintf("WHERE %s.%s = 'infinity' ", prefixStartAlias, startEntity.Temporal.ValidToColumn))
+		} else {
+			sql.WriteString("WHERE 1=1 ")
+		}
+
+		// Add temporal filter for relationship (junction table)
+		if rel.Temporal != nil {
+			sql.WriteString(fmt.Sprintf("AND j0.%s = 'infinity' ", rel.Temporal.ValidToColumn))
+		}
+
+		// Add ID filter if present
+		if q.From.ID != "" {
+			result.Params = append(result.Params, cleanID(q.From.ID))
+			sql.WriteString(fmt.Sprintf("AND %s.external_id = $%d ", prefixStartAlias, len(result.Params)))
+		}
 	}
 
-	// Add temporal filter for relationship (junction table)
-	if rel.Temporal != nil {
-		sql.WriteString(fmt.Sprintf("AND j0.%s = 'infinity' ", rel.Temporal.ValidToColumn))
-	}
+	sql.WriteString(" UNION ALL ")
 
-	// Add ID filter if present
-	if q.From.ID != "" {
-		result.Params = append(result.Params, q.From.ID)
-		sql.WriteString(fmt.Sprintf("AND %s.external_id = $%d ", startAlias, len(result.Params)))
-	}
-
-	sql.WriteString("UNION ALL ")
-
-	// Recursive case: follow relationship again (for self-referential relationships)
+	// === RECURSIVE CASE ===
 	sql.WriteString(fmt.Sprintf("SELECT j.%s AS id, p.depth + 1 FROM path_cte p ", targetKey))
 	sql.WriteString(fmt.Sprintf("JOIN %s j ON p.id = j.%s ", rel.JoinTable, sourceKey))
 
@@ -557,18 +788,511 @@ func (g *Generator) generateWithRecursivePath(q *Query, startEntity *Entity, sta
 
 	sql.WriteString(") ")
 
-	// Main query: select from target entity using the path results
-	sql.WriteString(fmt.Sprintf("SELECT DISTINCT t1.* FROM path_cte p "))
-	sql.WriteString(fmt.Sprintf("JOIN %s t1 ON p.id = t1.%s ", targetEntity.Table, targetEntity.PrimaryKey))
+	// === MAIN QUERY ===
+	sql.WriteString(fmt.Sprintf("SELECT DISTINCT t_final.* FROM path_cte p "))
+	sql.WriteString(fmt.Sprintf("JOIN %s t_final ON p.id = t_final.%s ", targetEntity.Table, targetEntity.PrimaryKey))
 	sql.WriteString(fmt.Sprintf("WHERE p.depth >= %d", minHops))
 
 	// Add temporal filter for target entity
 	if targetEntity.Temporal != nil {
-		sql.WriteString(" AND t1.valid_to = 'infinity'")
+		sql.WriteString(fmt.Sprintf(" AND t_final.%s = 'infinity'", targetEntity.Temporal.ValidToColumn))
 	}
 
 	result.SQL = sql.String()
 	return result, nil
+}
+
+// generateWithWildcardPath generates SQL for paths containing wildcard (*) traversals
+// For single-hop wildcards: UNION of all matching relationships
+// For recursive wildcards: Recursive CTE exploring all paths
+func (g *Generator) generateWithWildcardPath(q *Query, startEntity *Entity, startAlias, cteSQL string, cteParams []interface{}) (*GeneratedQuery, error) {
+	travs := q.Select.Path.Traversals
+	if len(travs) < 2 {
+		return nil, fmt.Errorf("wildcard path requires at least relationship and target entity")
+	}
+
+	// Find the wildcard traversal position
+	wildcardIdx := -1
+	for i := 0; i < len(travs); i += 2 {
+		if travs[i].IsWildcard() {
+			wildcardIdx = i
+			break
+		}
+	}
+
+	if wildcardIdx == -1 {
+		return nil, fmt.Errorf("no wildcard traversal found in path")
+	}
+
+	// Get the target entity from the traversal after the wildcard
+	if wildcardIdx+1 >= len(travs) {
+		return nil, fmt.Errorf("wildcard traversal requires target entity")
+	}
+
+	wildcardTrav := travs[wildcardIdx]
+	targetTrav := travs[wildcardIdx+1]
+	baseDirection := wildcardTrav.BaseDirection()
+
+	// Check if this is a recursive wildcard
+	if wildcardTrav.HasQuantifier() {
+		return g.generateRecursiveWildcardPath(q, startEntity, startAlias, cteSQL, cteParams)
+	}
+
+	// Single-hop wildcard: find all relationships that match
+	var matchingRels []*Relationship
+	if baseDirection == "->" {
+		// Outgoing: find relationships FROM current entity
+		for _, rel := range g.schema.FindRelationshipsFrom(startEntity.Name) {
+			// If target is also wildcard (*), include all relationships
+			// Otherwise, filter by target entity type
+			if targetTrav.IsWildcard() || rel.ToEntity == targetTrav.Target {
+				matchingRels = append(matchingRels, rel)
+			}
+		}
+	} else {
+		// Incoming: find relationships TO current entity
+		for _, rel := range g.schema.FindRelationshipsTo(startEntity.Name) {
+			if targetTrav.IsWildcard() || rel.FromEntity == targetTrav.Target {
+				matchingRels = append(matchingRels, rel)
+			}
+		}
+	}
+
+	if len(matchingRels) == 0 {
+		return nil, fmt.Errorf("no relationships found for wildcard traversal from %s", startEntity.Name)
+	}
+
+	// Generate UNION of all matching relationships
+	result := &GeneratedQuery{
+		Params: cteParams,
+	}
+
+	var unionParts []string
+	for i, rel := range matchingRels {
+		// Generate a query for this specific relationship
+		var sql strings.Builder
+
+		aliases := &aliasTracker{
+			aliases: make(map[string]string),
+			counter: 0,
+		}
+		entityAlias := aliases.next(startEntity.Name)
+		joinAlias := aliases.nextJoin()
+
+		var targetEntity *Entity
+		var sourceKey, targetKey string
+		if baseDirection == "->" {
+			targetEntity, _ = g.schema.GetEntity(rel.ToEntity)
+			sourceKey = rel.FromKey
+			targetKey = rel.ToKey
+		} else {
+			targetEntity, _ = g.schema.GetEntity(rel.FromEntity)
+			sourceKey = rel.ToKey
+			targetKey = rel.FromKey
+		}
+
+		targetAlias := aliases.next(targetEntity.Name)
+
+		// SELECT target.*, 'relationship_name' AS _relationship
+		sql.WriteString(fmt.Sprintf("SELECT %s.*, '%s' AS _relationship FROM %s %s ",
+			targetAlias, rel.Name, startEntity.Table, entityAlias))
+
+		// JOIN junction table
+		sql.WriteString(fmt.Sprintf("JOIN %s %s ON %s.%s = %s.%s ",
+			rel.JoinTable, joinAlias, entityAlias, startEntity.PrimaryKey, joinAlias, sourceKey))
+
+		// Add temporal filter for junction
+		if rel.Temporal != nil {
+			sql.WriteString(fmt.Sprintf("AND %s.%s = 'infinity' ", joinAlias, rel.Temporal.ValidToColumn))
+		}
+
+		// JOIN target entity
+		sql.WriteString(fmt.Sprintf("JOIN %s %s ON %s.%s = %s.%s ",
+			targetEntity.Table, targetAlias, joinAlias, targetKey, targetAlias, targetEntity.PrimaryKey))
+
+		// Add temporal filter for target
+		if targetEntity.Temporal != nil {
+			sql.WriteString(fmt.Sprintf("AND %s.%s = 'infinity' ", targetAlias, targetEntity.Temporal.ValidToColumn))
+		}
+
+		// WHERE clause
+		whereParts := []string{}
+
+		// Add ID filter if present
+		if q.From.ID != "" {
+			paramNum := len(result.Params) + 1
+			// Only add the ID param once for all UNIONs (reuse)
+			if i == 0 {
+				result.Params = append(result.Params, cleanID(q.From.ID))
+			}
+			whereParts = append(whereParts, fmt.Sprintf("%s.external_id = $%d", entityAlias, paramNum))
+		}
+
+		// Add temporal filter for start entity
+		if startEntity.Temporal != nil {
+			whereParts = append(whereParts, fmt.Sprintf("%s.%s = 'infinity'", entityAlias, startEntity.Temporal.ValidToColumn))
+		}
+
+		if len(whereParts) > 0 {
+			sql.WriteString("WHERE ")
+			sql.WriteString(strings.Join(whereParts, " AND "))
+		}
+
+		unionParts = append(unionParts, sql.String())
+	}
+
+	// Combine with UNION ALL
+	finalSQL := strings.Join(unionParts, " UNION ALL ")
+	result.SQL = cteSQL + finalSQL
+
+	return result, nil
+}
+
+// generateRecursiveWildcardPath generates a recursive CTE for wildcard paths with quantifiers
+// e.g., ->*{1,5}->entity explores any relationship chain up to 5 hops
+func (g *Generator) generateRecursiveWildcardPath(q *Query, startEntity *Entity, startAlias, cteSQL string, cteParams []interface{}) (*GeneratedQuery, error) {
+	result := &GeneratedQuery{
+		Params: cteParams,
+	}
+
+	travs := q.Select.Path.Traversals
+
+	// Find the wildcard traversal
+	wildcardIdx := -1
+	for i := 0; i < len(travs); i += 2 {
+		if travs[i].IsWildcard() {
+			wildcardIdx = i
+			break
+		}
+	}
+
+	if wildcardIdx == -1 || wildcardIdx+1 >= len(travs) {
+		return nil, fmt.Errorf("invalid wildcard path structure")
+	}
+
+	wildcardTrav := travs[wildcardIdx]
+	targetTrav := travs[wildcardIdx+1]
+	baseDirection := wildcardTrav.BaseDirection()
+
+	minHops := wildcardTrav.GetMinHops()
+	maxHops := wildcardTrav.GetMaxHops()
+
+	// Get all relationships we'll traverse
+	var allRels []*Relationship
+	if baseDirection == "->" {
+		// For outgoing wildcard, we need to consider all outgoing relationships from all entity types
+		for _, ent := range g.schema.Entities {
+			rels := g.schema.FindRelationshipsFrom(ent.Name)
+			allRels = append(allRels, rels...)
+		}
+	} else {
+		for _, ent := range g.schema.Entities {
+			rels := g.schema.FindRelationshipsTo(ent.Name)
+			allRels = append(allRels, rels...)
+		}
+	}
+
+	if len(allRels) == 0 {
+		return nil, fmt.Errorf("no relationships found for recursive wildcard")
+	}
+
+	// Build a mapping of entity -> table and entity -> primary key
+	// for the recursive CTE
+	var sql strings.Builder
+
+	if cteSQL != "" {
+		sql.WriteString(cteSQL[:len(cteSQL)-1]) // Remove trailing space
+		sql.WriteString(", ")
+	} else {
+		sql.WriteString("WITH ")
+	}
+
+	aliases := &aliasTracker{
+		aliases: make(map[string]string),
+		counter: 0,
+	}
+	prefixStartAlias := aliases.next(startEntity.Name)
+
+	sql.WriteString("RECURSIVE path_cte AS (")
+
+	// === BASE CASE ===
+	// Select all first-level relationships from the starting entity
+	baseParts := []string{}
+	startRels := g.schema.FindRelationshipsFrom(startEntity.Name)
+	if baseDirection == "<-" {
+		startRels = g.schema.FindRelationshipsTo(startEntity.Name)
+	}
+
+	for _, rel := range startRels {
+		var targetEnt *Entity
+		var sourceKey, targetKey string
+		if baseDirection == "->" {
+			targetEnt, _ = g.schema.GetEntity(rel.ToEntity)
+			sourceKey = rel.FromKey
+			targetKey = rel.ToKey
+		} else {
+			targetEnt, _ = g.schema.GetEntity(rel.FromEntity)
+			sourceKey = rel.ToKey
+			targetKey = rel.FromKey
+		}
+
+		basePart := fmt.Sprintf(
+			"SELECT j.%s AS id, '%s' AS entity_type, 1 AS depth FROM %s %s JOIN %s j ON %s.%s = j.%s",
+			targetKey, targetEnt.Name, startEntity.Table, prefixStartAlias, rel.JoinTable, prefixStartAlias, startEntity.PrimaryKey, sourceKey)
+
+		// Add temporal filters
+		if startEntity.Temporal != nil {
+			basePart += fmt.Sprintf(" AND %s.%s = 'infinity'", prefixStartAlias, startEntity.Temporal.ValidToColumn)
+		}
+		if rel.Temporal != nil {
+			basePart += fmt.Sprintf(" AND j.%s = 'infinity'", rel.Temporal.ValidToColumn)
+		}
+
+		// Add ID filter if present
+		if q.From.ID != "" {
+			if len(result.Params) == len(cteParams) {
+				result.Params = append(result.Params, cleanID(q.From.ID))
+			}
+			basePart += fmt.Sprintf(" AND %s.external_id = $%d", prefixStartAlias, len(result.Params))
+		}
+
+		baseParts = append(baseParts, basePart)
+	}
+
+	if len(baseParts) == 0 {
+		return nil, fmt.Errorf("no relationships from %s for wildcard traversal", startEntity.Name)
+	}
+
+	sql.WriteString(strings.Join(baseParts, " UNION ALL "))
+
+	sql.WriteString(" UNION ALL ")
+
+	// === RECURSIVE CASE ===
+	// For each entity type, find all outgoing relationships and add them
+	recursiveParts := []string{}
+
+	for _, ent := range g.schema.Entities {
+		var rels []*Relationship
+		if baseDirection == "->" {
+			rels = g.schema.FindRelationshipsFrom(ent.Name)
+		} else {
+			rels = g.schema.FindRelationshipsTo(ent.Name)
+		}
+
+		for _, rel := range rels {
+			var targetEnt *Entity
+			var sourceKey, targetKey string
+			if baseDirection == "->" {
+				targetEnt, _ = g.schema.GetEntity(rel.ToEntity)
+				sourceKey = rel.FromKey
+				targetKey = rel.ToKey
+			} else {
+				targetEnt, _ = g.schema.GetEntity(rel.FromEntity)
+				sourceKey = rel.ToKey
+				targetKey = rel.FromKey
+			}
+
+			recursivePart := fmt.Sprintf(
+				"SELECT j.%s AS id, '%s' AS entity_type, p.depth + 1 FROM path_cte p "+
+					"JOIN %s e ON p.id = e.%s AND p.entity_type = '%s' "+
+					"JOIN %s j ON e.%s = j.%s",
+				targetKey, targetEnt.Name,
+				ent.Table, ent.PrimaryKey, ent.Name,
+				rel.JoinTable, ent.PrimaryKey, sourceKey)
+
+			// Add temporal filters
+			if ent.Temporal != nil {
+				recursivePart += fmt.Sprintf(" AND e.%s = 'infinity'", ent.Temporal.ValidToColumn)
+			}
+			if rel.Temporal != nil {
+				recursivePart += fmt.Sprintf(" AND j.%s = 'infinity'", rel.Temporal.ValidToColumn)
+			}
+
+			recursivePart += fmt.Sprintf(" WHERE p.depth < %d", maxHops)
+
+			recursiveParts = append(recursiveParts, recursivePart)
+		}
+	}
+
+	if len(recursiveParts) > 0 {
+		sql.WriteString(strings.Join(recursiveParts, " UNION ALL "))
+	}
+
+	sql.WriteString(") ")
+
+	// === MAIN QUERY ===
+	// If target is a specific entity type, filter by it
+	if !targetTrav.IsWildcard() && targetTrav.Target != "" {
+		targetEntity, err := g.schema.GetEntity(targetTrav.Target)
+		if err != nil {
+			return nil, fmt.Errorf("unknown target entity %s: %w", targetTrav.Target, err)
+		}
+
+		sql.WriteString(fmt.Sprintf(
+			"SELECT DISTINCT t.* FROM path_cte p "+
+				"JOIN %s t ON p.id = t.%s AND p.entity_type = '%s' "+
+				"WHERE p.depth >= %d",
+			targetEntity.Table, targetEntity.PrimaryKey, targetEntity.Name, minHops))
+
+		if targetEntity.Temporal != nil {
+			sql.WriteString(fmt.Sprintf(" AND t.%s = 'infinity'", targetEntity.Temporal.ValidToColumn))
+		}
+	} else {
+		// Wildcard target: return all entities (needs UNION of all entity tables)
+		// This is complex - for now, return just the IDs with entity_type
+		sql.WriteString(fmt.Sprintf(
+			"SELECT DISTINCT p.id, p.entity_type, p.depth FROM path_cte p WHERE p.depth >= %d", minHops))
+	}
+
+	result.SQL = sql.String()
+	return result, nil
+}
+
+// processJoinClause handles a JOIN clause with path traversal
+// Returns the SQL joins and the ON condition
+func (g *Generator) processJoinClause(joinClause *JoinClause, aliases *aliasTracker, existingJoins *[]string, paramOffset int) ([]string, string, error) {
+	var joins []string
+
+	// Get the starting entity for this JOIN
+	joinEntity, err := g.schema.GetEntity(joinClause.Entity)
+	if err != nil {
+		return nil, "", fmt.Errorf("unknown entity in JOIN clause: %w", err)
+	}
+
+	// Create alias for the join starting entity
+	joinStartAlias := aliases.next(joinClause.Entity)
+
+	// Register the user-provided alias if specified
+	if joinClause.Alias != "" {
+		aliases.aliases[joinClause.Alias] = joinStartAlias
+	}
+
+	// Determine join type
+	joinType := "JOIN"
+	if joinClause.Type == "LEFTJOIN" || joinClause.Type == "LEFT JOIN" {
+		joinType = "LEFT JOIN"
+	}
+
+	// Build the initial entity join (this is a cross join initially, constrained by ON condition)
+	initialJoin := fmt.Sprintf("%s %s %s", joinType, joinEntity.Table, joinStartAlias)
+
+	// Add temporal filter for the join entity if applicable
+	if joinEntity.Temporal != nil {
+		initialJoin += fmt.Sprintf(" ON %s.%s = 'infinity'", joinStartAlias, joinEntity.Temporal.ValidToColumn)
+	} else {
+		initialJoin += " ON 1=1" // Placeholder for cross join
+	}
+
+	// Add ID filter if specified
+	if joinClause.ID != "" {
+		initialJoin = fmt.Sprintf("%s %s %s ON %s.external_id = '%s'",
+			joinType, joinEntity.Table, joinStartAlias, joinStartAlias, cleanID(joinClause.ID))
+		if joinEntity.Temporal != nil {
+			initialJoin += fmt.Sprintf(" AND %s.%s = 'infinity'", joinStartAlias, joinEntity.Temporal.ValidToColumn)
+		}
+	}
+
+	joins = append(joins, initialJoin)
+
+	// Process path traversals if any
+	currentEntity := joinClause.Entity
+	currentAlias := joinStartAlias
+
+	if len(joinClause.Path) > 0 {
+		// Process in pairs: (relationship, entity)
+		for i := 0; i < len(joinClause.Path); i += 2 {
+			if i+1 >= len(joinClause.Path) {
+				return nil, "", fmt.Errorf("incomplete path in JOIN: relationship without target entity")
+			}
+
+			relTrav := joinClause.Path[i]
+			entTrav := joinClause.Path[i+1]
+
+			baseDirection := relTrav.BaseDirection()
+
+			rel, err := g.schema.FindRelationship(currentEntity, relTrav.Target, baseDirection)
+			if err != nil {
+				return nil, "", err
+			}
+
+			prevEntityDef, _ := g.schema.GetEntity(currentEntity)
+
+			var sourceKey, targetKey string
+			if baseDirection == "->" {
+				sourceKey = rel.FromKey
+				targetKey = rel.ToKey
+			} else {
+				sourceKey = rel.ToKey
+				targetKey = rel.FromKey
+			}
+
+			// Junction table join
+			junctionAlias := aliases.nextJoin()
+			junctionJoin := fmt.Sprintf("JOIN %s %s ON %s.%s = %s.%s",
+				rel.JoinTable, junctionAlias,
+				currentAlias, prevEntityDef.PrimaryKey,
+				junctionAlias, sourceKey)
+
+			// Add temporal filter for junction
+			if rel.Temporal != nil {
+				junctionJoin += fmt.Sprintf(" AND %s.%s = 'infinity'", junctionAlias, rel.Temporal.ValidToColumn)
+			}
+
+			joins = append(joins, junctionJoin)
+
+			// Register relationship alias if specified
+			if relTrav.Alias != "" {
+				aliases.aliases[relTrav.Alias] = junctionAlias
+			}
+
+			// Target entity join
+			targetEntityDef, err := g.schema.GetEntity(entTrav.Target)
+			if err != nil {
+				return nil, "", err
+			}
+
+			targetAlias := aliases.next(entTrav.Target)
+			targetJoin := fmt.Sprintf("JOIN %s %s ON %s.%s = %s.%s",
+				targetEntityDef.Table, targetAlias,
+				junctionAlias, targetKey,
+				targetAlias, targetEntityDef.PrimaryKey)
+
+			// Add temporal filter for target entity
+			if targetEntityDef.Temporal != nil {
+				targetJoin += fmt.Sprintf(" AND %s.%s = 'infinity'", targetAlias, targetEntityDef.Temporal.ValidToColumn)
+			}
+
+			joins = append(joins, targetJoin)
+
+			// Register entity alias if specified
+			if entTrav.Alias != "" {
+				aliases.aliases[entTrav.Alias] = targetAlias
+			}
+
+			currentEntity = entTrav.Target
+			currentAlias = targetAlias
+		}
+	}
+
+	// Generate ON condition
+	var onCondition string
+	if joinClause.On != nil {
+		leftAlias, ok := aliases.aliases[joinClause.On.Left.Alias]
+		if !ok {
+			return nil, "", fmt.Errorf("unknown alias '%s' in JOIN ON condition", joinClause.On.Left.Alias)
+		}
+		rightAlias, ok := aliases.aliases[joinClause.On.Right.Alias]
+		if !ok {
+			return nil, "", fmt.Errorf("unknown alias '%s' in JOIN ON condition", joinClause.On.Right.Alias)
+		}
+
+		onCondition = fmt.Sprintf("%s.%s %s %s.%s",
+			leftAlias, joinClause.On.Left.Field,
+			joinClause.On.Op,
+			rightAlias, joinClause.On.Right.Field)
+	}
+
+	return joins, onCondition, nil
 }
 
 // processTraversals handles graph traversal path and returns the result
@@ -594,6 +1318,12 @@ func (g *Generator) processTraversals(travs []*Traversal, currentEntity, prevAli
 
 		// Use base direction for relationship lookup (strip optional marker)
 		baseDirection := relTrav.BaseDirection()
+
+		// For bidirectional traversals, we need to find the relationship and generate joins for both directions
+		if baseDirection == "<->" {
+			return g.processBidirectionalTraversal(travs[i:], currentEntity, prevAlias, aliases, joins, result)
+		}
+
 		rel, err := g.schema.FindRelationship(currentEntity, relTrav.Target, baseDirection)
 		if err != nil {
 			return nil, err
@@ -653,6 +1383,11 @@ func (g *Generator) processTraversals(travs []*Traversal, currentEntity, prevAli
 			result.JunctionFields = append(result.JunctionFields, fmt.Sprintf("%s.%s", joinAlias, relTrav.Field))
 		}
 
+		// Store alias for traversal if it has one
+		if relTrav.Alias != "" {
+			aliases.aliases[relTrav.Alias] = joinAlias
+		}
+
 		// Target table join
 		targetEntityDef, err := g.schema.GetEntity(expectedEntity)
 		if err != nil {
@@ -666,10 +1401,95 @@ func (g *Generator) processTraversals(travs []*Traversal, currentEntity, prevAli
 			targetAlias, targetEntityDef.PrimaryKey,
 		))
 
+		// Store alias for entity traversal if it has one
+		if entTrav.Alias != "" {
+			aliases.aliases[entTrav.Alias] = targetAlias
+		}
+
 		currentEntity = expectedEntity
 		result.FinalAlias = targetAlias
 	}
 
+	return result, nil
+}
+
+// processBidirectionalTraversal handles <-> traversals by generating joins for both directions
+func (g *Generator) processBidirectionalTraversal(travs []*Traversal, currentEntity, prevAlias string, aliases *aliasTracker, joins *[]string, result *TraversalResult) (*TraversalResult, error) {
+	if len(travs) < 2 {
+		return nil, fmt.Errorf("incomplete bidirectional path")
+	}
+
+	relTrav := travs[0]
+	entTrav := travs[1]
+	expectedEntity := entTrav.Target
+
+	// For bidirectional, try to find relationship in either direction
+	var rel *Relationship
+	var err error
+	var direction string
+
+	// Try outgoing first
+	rel, err = g.schema.FindRelationship(currentEntity, relTrav.Target, "->")
+	if err == nil && rel.ToEntity == expectedEntity {
+		direction = "->"
+	} else {
+		// Try incoming
+		rel, err = g.schema.FindRelationship(currentEntity, relTrav.Target, "<-")
+		if err == nil && rel.FromEntity == expectedEntity {
+			direction = "<-"
+		} else {
+			return nil, fmt.Errorf("bidirectional relationship %s not found connecting %s and %s",
+				relTrav.Target, currentEntity, expectedEntity)
+		}
+	}
+
+	prevEntity, _ := g.schema.GetEntity(currentEntity)
+
+	var targetKey, sourceKey string
+	if direction == "->" {
+		sourceKey = rel.FromKey
+		targetKey = rel.ToKey
+	} else {
+		sourceKey = rel.ToKey
+		targetKey = rel.FromKey
+	}
+
+	// For bidirectional, generate OR condition for both directions
+	joinAlias := aliases.nextJoin()
+	joinCondition := fmt.Sprintf("(%s.%s = %s.%s OR %s.%s = %s.%s)",
+		result.FinalAlias, prevEntity.PrimaryKey, joinAlias, rel.FromKey,
+		result.FinalAlias, prevEntity.PrimaryKey, joinAlias, rel.ToKey)
+
+	if rel.Temporal != nil {
+		joinCondition = fmt.Sprintf("(%s) AND %s.%s = 'infinity'", joinCondition, joinAlias, rel.Temporal.ValidToColumn)
+	}
+
+	*joins = append(*joins, fmt.Sprintf(
+		"JOIN %s %s ON %s",
+		rel.JoinTable, joinAlias,
+		joinCondition,
+	))
+
+	if relTrav.Field != "" {
+		result.JunctionFields = append(result.JunctionFields, fmt.Sprintf("%s.%s", joinAlias, relTrav.Field))
+	}
+
+	targetEntityDef, err := g.schema.GetEntity(expectedEntity)
+	if err != nil {
+		return nil, err
+	}
+	targetAlias := aliases.next(expectedEntity)
+
+	// For bidirectional, target can match either key
+	*joins = append(*joins, fmt.Sprintf(
+		"JOIN %s %s ON (%s.%s = %s.%s OR %s.%s = %s.%s) AND %s.%s != %s.%s",
+		targetEntityDef.Table, targetAlias,
+		joinAlias, targetKey, targetAlias, targetEntityDef.PrimaryKey,
+		joinAlias, sourceKey, targetAlias, targetEntityDef.PrimaryKey,
+		targetAlias, targetEntityDef.PrimaryKey, result.FinalAlias, prevEntity.PrimaryKey,
+	))
+
+	result.FinalAlias = targetAlias
 	return result, nil
 }
 
@@ -762,13 +1582,21 @@ func (g *Generator) generateFieldExprWithAggCheck(f *FieldExpr, startAlias, curr
 		if err != nil {
 			return "", false, err
 		}
-		// Include junction fields if any were collected during traversal
-		if len(travResult.JunctionFields) > 0 {
-			parts := []string{fmt.Sprintf("%s.*", travResult.FinalAlias)}
-			parts = append(parts, travResult.JunctionFields...)
-			fieldSQL = strings.Join(parts, ", ")
+
+		// Check if the last traversal specifies a field (e.g., ->groups.name)
+		lastTrav := f.Path.Traversals[len(f.Path.Traversals)-1]
+		if lastTrav.Field != "" {
+			// Select specific field from target entity
+			fieldSQL = fmt.Sprintf("%s.%s", travResult.FinalAlias, lastTrav.Field)
 		} else {
-			fieldSQL = fmt.Sprintf("%s.*", travResult.FinalAlias)
+			// Include junction fields if any were collected during traversal
+			if len(travResult.JunctionFields) > 0 {
+				parts := []string{fmt.Sprintf("%s.*", travResult.FinalAlias)}
+				parts = append(parts, travResult.JunctionFields...)
+				fieldSQL = strings.Join(parts, ", ")
+			} else {
+				fieldSQL = fmt.Sprintf("%s.*", travResult.FinalAlias)
+			}
 		}
 	} else if f.Field != nil {
 		alias := startAlias

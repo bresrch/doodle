@@ -100,3 +100,8 @@ func (db *DB) WithConnection(conn *sql.DB) *DB {
 	db.conn = conn
 	return db
 }
+
+// Raw returns the underlying *sql.DB connection for direct SQL operations
+func (db *DB) Raw() *sql.DB {
+	return db.conn
+}
